@@ -67,7 +67,7 @@ EOF
 
 # ── Default cloud-config (overridden by config_url= at boot) ────
 # ── config_url fetch helper ─────────────────────────────────
-RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/null | sed "s/^config_url=//")\nif [ -n "$URL" ]; then\n  echo "config_url: fetching $URL"\n  curl -sf "$URL" -o /tmp/cloud-config.yaml && cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml\nfi\n' > /usr/local/bin/config-url-fetch.sh && \
+RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/null | sed "s/^config_url=//")\nif [ -z "$URL" ]; then\n  echo "config_url: no config_url= on /proc/cmdline"\n  exit 0\nfi\nN=0\nwhile [ $N -lt 5 ]; do\n  echo "config_url: attempt $((N+1))/5: fetching $URL"\n  if curl -sf "$URL" -o /tmp/cloud-config.yaml; then\n    echo "config_url: downloaded $(wc -c < /tmp/cloud-config.yaml) bytes"\n    mkdir -p /system/oem\n    cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml\n    exit 0\n  fi\n  N=$((N+1))\n  sleep 3\ndone\necho "config_url: FAILED after 5 attempts"\n' > /usr/local/bin/config-url-fetch.sh && \
     chmod +x /usr/local/bin/config-url-fetch.sh
 
 # ── Default cloud-config (overridden by config_url= at boot) ──
