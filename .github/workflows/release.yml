@@ -7,17 +7,17 @@ jobs:
   build:
     uses: kairos-io/kairos-factory-action/.github/workflows/reusable-factory.yaml@main
     with:
+      version: "auto"
       base_image: "alpine:3.24"
       dockerfile_path: "Dockerfile.kairos"
       model: "generic"
       iso: true
-      release: true
-      draft: true
+      release: false
       registry_domain: "ghcr.io"
       summary_artifacts: true
     secrets: inherit
 
-  manifest:
+  release:
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -30,6 +30,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Download artifacts from the factory action
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
 
       - name: Get image digest
         id: digest
@@ -88,9 +94,16 @@ jobs:
           echo "=== release.json ==="
           cat release.json
 
-      - name: Upload & publish
+      - name: Create GitHub Release
         run: |
-          gh release upload ${{ github.ref_name }} release.json
-          gh release edit ${{ github.ref_name }} --draft=false
+          TAG="${{ github.ref_name }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            *.iso *.iso.sha256 release.json || true
+          # Fallback: if no ISO artifacts, just release.json
+          if ! gh release view "$TAG" &>/dev/null; then
+            gh release create "$TAG" --title "$TAG" --generate-notes release.json
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
