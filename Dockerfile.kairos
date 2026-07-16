@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1
+# Kairos Alpine image with Nomad + Podman + CNI + BIRD stack
+# Role-agnostic — cloud-config injected at boot via config_url=
+
+FROM quay.io/kairos/kairos-init:v0.16.1 AS kairos-init
+
+FROM alpine:3.24
+
+ARG KAIROS_VERSION=v0.0.1
+ENV KAIROS_VERSION=${KAIROS_VERSION}
+
+# ── Kairos framework ────────────────────────────────────────────
+RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
+    /kairos-init -l debug --version "${KAIROS_VERSION}" && \
+    rm -f /kairos-init
+
+# ── Runtime dependencies ────────────────────────────────────────
+RUN apk add --no-cache \
+    # Core
+    curl ca-certificates bash jq \
+    # Networking
+    nftables iproute2 iptables conntrack-tools \
+    # CNI
+    cni-plugins cni-plugin-flannel \
+    # Storage
+    e2fsprogs xfsprogs btrfs-progs \
+    # Process supervision
+    openrc \
+    # tiny-cloud (minimal cloud-init for Alpine)
+    udev \
+    # QEMU guest agent
+    qemu-guest-agent
+
+# ── CNI config ──────────────────────────────────────────────────
+RUN mkdir -p /etc/cni/net.d && \
+    cat > /etc/cni/net.d/10-ptp.conflist << 'EOF'
+{
+  "cniVersion": "1.0.0",
+  "name": "ptp",
+  "plugins": [
+    {
+      "type": "ptp",
+      "ipMasq": true,
+      "ipam": {
+        "type": "host-local",
+        "subnet": "10.77.0.0/16",
+        "routes": [{ "dst": "0.0.0.0/0" }]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": { "portMappings": true }
+    },
+    {
+      "type": "firewall"
+    }
+  ]
+}
+EOF
+
+# ── Default cloud-config (overridden by config_url= at boot) ────
+RUN mkdir -p /system/oem && \
+    cat > /system/oem/99_defaults.yaml << 'EOF'
+#cloud-config
+stages:
+  initramfs:
+    - name: "Provision via config_url"
+      if: '[ -n "$(cat /proc/cmdline | grep -o config_url=[^ ]* | cut -d= -f2)" ]'
+      commands:
+        - curl -sf "$(cat /proc/cmdline | grep -o 'config_url=[^ ]*' | cut -d= -f2)" -o /tmp/cloud-config.yaml
+        - cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml
+  boot:
+    - name: "Default packages"
+      packages:
+        install:
+          - htop
+          - vim
+          - tmux
+          - curl
+          - jq
+EOF
+
+# ── Healthcheck ──────────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD kairos-agent state || exit 1
+
+# ── Labels ──────────────────────────────────────────────────────
+LABEL org.opencontainers.image.title="kairos-alpine"
+LABEL org.opencontainers.image.description="Kairos OS on Alpine with Nomad/Podman stack"
+LABEL org.opencontainers.image.source="https://github.com/k3s-forge/kairos-alpine"
+LABEL org.opencontainers.image.version="${KAIROS_VERSION}"
