@@ -60,16 +60,18 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Download ISO artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*.iso*'
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify ISO files
         run: |
-          gh run download ${{ github.run_id }} -D /tmp/artifacts
-          echo "=== All downloaded ==="
-          find /tmp/artifacts -type f | head -30
           echo "=== ISO files ==="
-          find /tmp/artifacts -name "*.iso" -exec cp {} . \; 2>/dev/null || true
-          find /tmp/artifacts -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
           ls -la *.iso *.sha256 2>/dev/null || echo "(no ISO files)"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "=== All files ==="
+          find . -maxdepth 1 -type f | sort
 
       - name: Get image digest
         id: digest
