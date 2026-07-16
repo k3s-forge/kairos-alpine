@@ -14,24 +14,24 @@ jobs:
       - name: Build release.json
         run: |
           set -euo pipefail
-          TAG="\$\{\{ github.ref_name \}\}"
-          COMMIT="\$\{\{ github.sha \}\}"
-          REPO="\$\{\{ github.repository \}\}"
-          REPO_LOWER=\$(echo "\$REPO" | tr '[:upper:]' '[:lower:]')
-          RUN_ID="\$\{\{ github.run_id \}\}"
-          VERSION=\$(echo "\$TAG" | sed 's/^v//' | sed 's/\\.[0-9]*\$/.0/')
-          CREATED=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="${{ github.ref_name }}"
+          COMMIT="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+          REPO_LOWER=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          RUN_ID="${{ github.run_id }}"
+          VERSION=$(echo "$TAG" | sed 's/^v//' | sed 's/\\.[0-9]*$/.0/')
+          CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           cat > release.json << JSONEOF
           {
             "schema": "transform.node-release/v1",
-            "version": "\${VERSION}",
+            "version": "${VERSION}",
             "kairos": {
-              "version": "\${TAG}",
+              "version": "${TAG}",
               "flavor": "alpine",
               "baseVersion": "3.24"
             },
             "image": {
-              "oci": "ghcr.io/\${REPO_LOWER}",
+              "oci": "ghcr.io/${REPO_LOWER}",
               "architectures": {
                 "amd64": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 "arm64": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -39,20 +39,20 @@ jobs:
               "verification": {
                 "cosign": {
                   "issuer": "https://token.actions.githubusercontent.com",
-                  "identity": "https://github.com/\${REPO}/.github/workflows/release.yml@refs/tags/\${TAG}"
+                  "identity": "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
                 },
                 "attestations": true,
                 "sbom": "spdx-json"
               }
             },
             "provenance": {
-              "repository": "\${REPO}",
-              "commit": "\${COMMIT}",
+              "repository": "${REPO}",
+              "commit": "${COMMIT}",
               "workflow": "release.yml",
-              "runUrl": "https://github.com/\${REPO}/actions/runs/\${RUN_ID}"
+              "runUrl": "https://github.com/${REPO}/actions/runs/${RUN_ID}"
             },
             "minimumDiskGb": 20,
-            "createdAt": "\${CREATED}"
+            "createdAt": "${CREATED}"
           }
           JSONEOF
           echo "=== release.json ==="
