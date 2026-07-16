@@ -6,6 +6,11 @@ on:
 jobs:
   build:
     uses: kairos-io/kairos-factory-action/.github/workflows/reusable-factory.yaml@main
+    permissions:
+      actions: read
+      contents: write
+      security-events: write
+      id-token: write
     with:
       version: "auto"
       base_image: "alpine:3.24"
@@ -31,7 +36,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Download artifacts from the factory action
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -97,12 +101,9 @@ jobs:
       - name: Create GitHub Release
         run: |
           TAG="${{ github.ref_name }}"
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            *.iso *.iso.sha256 release.json || true
-          # Fallback: if no ISO artifacts, just release.json
-          if ! gh release view "$TAG" &>/dev/null; then
+          if ls *.iso *.iso.sha256 1>/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes *.iso *.iso.sha256 release.json
+          else
             gh release create "$TAG" --title "$TAG" --generate-notes release.json
           fi
         env:
