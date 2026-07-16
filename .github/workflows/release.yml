@@ -1,0 +1,51 @@
+name: Build & Release Kairos OS
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build OS image
+        run: |
+          mkdir -p dist
+          echo "Kairos OS ${{ github.ref_name }}" > dist/version.txt
+          jq -n --arg ver "${{ github.ref_name }}" \
+                --arg commit "${{ github.sha }}" \
+                --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              schema: "transform.node-release/v1",
+              version: ($created | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y.%m.0")),
+              kairos: { version: $ver, flavor: "alpine", baseVersion: "3.24" },
+              image: {
+                oci: ("ghcr.io/" + env.GITHUB_REPOSITORY | ascii_downcase),
+                architectures: {},
+                verification: {
+                  cosign: {
+                    issuer: "https://token.actions.githubusercontent.com",
+                    identity: ("https://github.com/" + env.GITHUB_REPOSITORY + "/.github/workflows/release.yml@refs/heads/main")
+                  },
+                  attestations: true,
+                  sbom: "spdx-json"
+                }
+              },
+              provenance: {
+                repository: env.GITHUB_REPOSITORY,
+                commit: $commit,
+                workflow: "release.yml",
+                runUrl: $run_url
+              },
+              minimumDiskGb: 20,
+              createdAt: $created
+            }' > release.json
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release.json
+          generate_release_notes: true
