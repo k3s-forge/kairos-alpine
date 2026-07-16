@@ -47,26 +47,29 @@ jobs:
           context: .
           file: Dockerfile.kairos
           push: true
-          build-args:
-            - KAIROS_FLAVOR_RELEASE=${{ github.ref_name }}
-          tags:
-            - ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            - ghcr.io/${{ github.repository }}:latest
-          labels:
-            - org.opencontainers.image.version=${{ github.ref_name }}
-            - org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            KAIROS_FLAVOR_RELEASE=${{ github.ref_name }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Download build artifacts
+      - name: Download ISO artifacts
         run: |
-          gh run download ${{ github.run_id }}
-          echo "=== Downloaded ==="
-          find . -type f | head -50
-          find . -name "*.iso" -exec cp {} . \; 2>/dev/null || true
-          find . -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
+          gh run download ${{ github.run_id }} -n "*.iso*" -D /tmp/iso || true
+          gh run download ${{ github.run_id }} -D /tmp/all || true
+          echo "=== All artifacts ==="
+          find /tmp/all -type f 2>/dev/null | head -20 || echo "none"
           echo "=== ISO files ==="
-          ls -la *.iso *.sha256 2>/dev/null || echo "(no ISO/sha256 files)"
+          find /tmp/iso -name "*.iso" -exec cp {} . \; 2>/dev/null || true
+          find /tmp/iso -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
+          find /tmp/all -name "*.iso" -exec cp {} . \; 2>/dev/null || true
+          find /tmp/all -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
+          ls -la *.iso *.sha256 2>/dev/null || echo "(no ISO files)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
