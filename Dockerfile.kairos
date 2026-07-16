@@ -64,16 +64,19 @@ RUN mkdir -p /etc/cni/net.d && \
 EOF
 
 # ── Default cloud-config (overridden by config_url= at boot) ────
+# ── config_url fetch helper ─────────────────────────────────
+RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/null | sed "s/^config_url=//")\nif [ -n "$URL" ]; then\n  echo "config_url: fetching $URL"\n  curl -sf "$URL" -o /tmp/cloud-config.yaml && cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml\nfi\n' > /usr/local/bin/config-url-fetch.sh && \
+    chmod +x /usr/local/bin/config-url-fetch.sh
+
+# ── Default cloud-config (overridden by config_url= at boot) ──
 RUN mkdir -p /system/oem && \
     cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
   initramfs:
     - name: "Provision via config_url"
-      if: '[ -n "$(cat /proc/cmdline | grep -o config_url=[^ ]* | cut -d= -f2)" ]'
       commands:
-        - curl -sf "$(cat /proc/cmdline | grep -o 'config_url=[^ ]*' | cut -d= -f2)" -o /tmp/cloud-config.yaml
-        - cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml
+        - /usr/local/bin/config-url-fetch.sh
   boot:
     - name: "Default packages"
       packages:
