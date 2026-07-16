@@ -1,4 +1,4 @@
-name: Build & Release Kairos OS
+sha256:0000000000000000000000000000000000000000000000000000000000000000name: Build & Release Kairos OS
 on:
   push:
     tags: ["v*"]
@@ -44,8 +44,7 @@ jobs:
           echo "Image digest: ${DIGEST}"
       - uses: sigstore/cosign-installer@v3
       - name: Sign image
-        run: |
-          cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
+        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
       - name: Build release manifest
         run: |
           set -euo pipefail
@@ -69,11 +68,17 @@ jobs:
             "image": {
               "oci": "ghcr.io/${REPO_LOWER}",
               "digest": "${IMAGE_DIGEST}",
+              "architectures": {
+                "amd64": "${IMAGE_DIGEST}",
+                "arm64": ""
+              },
               "verification": {
                 "cosign": {
                   "issuer": "https://token.actions.githubusercontent.com",
                   "identity": "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
-                }
+                },
+                "attestations": true,
+                "sbom": "spdx-json"
               }
             },
             "provenance": {
@@ -81,11 +86,6 @@ jobs:
               "commit": "${COMMIT}",
               "workflow": "release.yml",
               "runUrl": "https://github.com/${REPO}/actions/runs/${RUN_ID}"
-            },
-            "boot": {
-              "method": "auroraboot",
-              "image": "quay.io/kairos/auroraboot:v0.23.0",
-              "command": "docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v $(pwd)/dist:/tmp/auroraboot quay.io/kairos/auroraboot:v0.23.0 --set container_image=ghcr.io/${REPO_LOWER}:${TAG} --set disk.size=20000 --set state_dir=/tmp/auroraboot --set output.iso=true --set output.raw=true"
             },
             "minimumDiskGb": 20,
             "createdAt": "${CREATED}"
