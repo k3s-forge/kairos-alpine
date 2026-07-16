@@ -11,39 +11,52 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Build OS image
+      - name: Build release.json
         run: |
-          mkdir -p dist
-          echo "Kairos OS ${{ github.ref_name }}" > dist/version.txt
-          jq -n --arg ver "${{ github.ref_name }}" \
-                --arg commit "${{ github.sha }}" \
-                --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-                --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{
-              schema: "transform.node-release/v1",
-              version: ($created | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y.%m.0")),
-              kairos: { version: $ver, flavor: "alpine", baseVersion: "3.24" },
-              image: {
-                oci: ("ghcr.io/" + env.GITHUB_REPOSITORY | ascii_downcase),
-                architectures: {},
-                verification: {
-                  cosign: {
-                    issuer: "https://token.actions.githubusercontent.com",
-                    identity: ("https://github.com/" + env.GITHUB_REPOSITORY + "/.github/workflows/release.yml@refs/heads/main")
-                  },
-                  attestations: true,
-                  sbom: "spdx-json"
-                }
+          set -euo pipefail
+          TAG="\$\{\{ github.ref_name \}\}"
+          COMMIT="\$\{\{ github.sha \}\}"
+          REPO="\$\{\{ github.repository \}\}"
+          REPO_LOWER=\$(echo "\$REPO" | tr '[:upper:]' '[:lower:]')
+          RUN_ID="\$\{\{ github.run_id \}\}"
+          VERSION=\$(echo "\$TAG" | sed 's/^v//' | sed 's/\\.[0-9]*\$/.0/')
+          CREATED=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > release.json << JSONEOF
+          {
+            "schema": "transform.node-release/v1",
+            "version": "\${VERSION}",
+            "kairos": {
+              "version": "\${TAG}",
+              "flavor": "alpine",
+              "baseVersion": "3.24"
+            },
+            "image": {
+              "oci": "ghcr.io/\${REPO_LOWER}",
+              "architectures": {
+                "amd64": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "arm64": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
               },
-              provenance: {
-                repository: env.GITHUB_REPOSITORY,
-                commit: $commit,
-                workflow: "release.yml",
-                runUrl: $run_url
-              },
-              minimumDiskGb: 20,
-              createdAt: $created
-            }' > release.json
+              "verification": {
+                "cosign": {
+                  "issuer": "https://token.actions.githubusercontent.com",
+                  "identity": "https://github.com/\${REPO}/.github/workflows/release.yml@refs/tags/\${TAG}"
+                },
+                "attestations": true,
+                "sbom": "spdx-json"
+              }
+            },
+            "provenance": {
+              "repository": "\${REPO}",
+              "commit": "\${COMMIT}",
+              "workflow": "release.yml",
+              "runUrl": "https://github.com/\${REPO}/actions/runs/\${RUN_ID}"
+            },
+            "minimumDiskGb": 20,
+            "createdAt": "\${CREATED}"
+          }
+          JSONEOF
+          echo "=== release.json ==="
+          cat release.json
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
