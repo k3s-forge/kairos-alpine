@@ -65,9 +65,8 @@ RUN mkdir -p /etc/cni/net.d && \
 }
 EOF
 
-# ── Default cloud-config (overridden by config_url= at boot) ────
-# ── config_url fetch helper ─────────────────────────────────
-RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/null | sed "s/^config_url=//")\nif [ -z "$URL" ]; then\n  echo "config_url: no config_url= on /proc/cmdline"\n  exit 0\nfi\nN=0\nwhile [ $N -lt 5 ]; do\n  echo "config_url: attempt $((N+1))/5: fetching $URL"\n  if curl -sf "$URL" -o /tmp/cloud-config.yaml; then\n    echo "config_url: downloaded $(wc -c < /tmp/cloud-config.yaml) bytes"\n    mkdir -p /system/oem\n    cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml\n    exit 0\n  fi\n  N=$((N+1))\n  sleep 3\ndone\necho "config_url: FAILED after 5 attempts"\n' > /usr/local/bin/config-url-fetch.sh && \
+# ── config_url fetch helper (with timeout + retry) ────────────
+RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/null | sed "s/^config_url=//")\nif [ -z "$URL" ]; then\n  echo "config_url: no config_url= on /proc/cmdline"\n  exit 0\nfi\nN=0\nwhile [ $N -lt 5 ]; do\n  echo "config_url: attempt $((N+1))/5: fetching $URL"\n  if curl -sf --connect-timeout 10 --max-time 30 "$URL" -o /tmp/cloud-config.yaml; then\n    echo "config_url: downloaded $(wc -c < /tmp/cloud-config.yaml) bytes"\n    mkdir -p /system/oem\n    cp /tmp/cloud-config.yaml /system/oem/90_custom.yaml\n    exit 0\n  fi\n  N=$((N+1))\n  sleep 3\ndone\necho "config_url: FAILED after 5 attempts"\n' > /usr/local/bin/config-url-fetch.sh && \
     chmod +x /usr/local/bin/config-url-fetch.sh
 
 # ── Default cloud-config (overridden by config_url= at boot) ──
@@ -76,7 +75,7 @@ RUN mkdir -p /system/oem && \
     cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
-  initramfs:
+  network:
     - name: "Provision via config_url"
       commands:
         - /usr/local/bin/config-url-fetch.sh
