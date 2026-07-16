@@ -3,16 +3,14 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  actions: read
-  contents: write
-  packages: write
-  security-events: write
-  id-token: write
-
 jobs:
   build:
     uses: kairos-io/kairos-factory-action/.github/workflows/reusable-factory.yaml@main
+    permissions:
+      actions: read
+      contents: write
+      security-events: write
+      id-token: write
     with:
       version: "auto"
       base_image: "alpine:3.24"
@@ -26,6 +24,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
