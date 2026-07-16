@@ -1,0 +1,6 @@
+name: "Reload init after installer setup"
+stages:
+  initramfs:
+    - if: 'grep -q "kairos-agent install" /etc/inittab'
+      commands:
+        - kill -HUP 1
