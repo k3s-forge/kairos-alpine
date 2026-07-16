@@ -11,7 +11,6 @@ jobs:
     permissions:
       contents: write
       packages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -41,9 +40,6 @@ jobs:
         run: |
           DIGEST=$(docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ github.ref_name }} --format "{{json .}}" | jq -r ".manifest.digest")
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign image
-        run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
       - name: Build release manifest
         run: |
           set -euo pipefail
@@ -90,7 +86,6 @@ jobs:
             "createdAt": "${CREATED}"
           }
           JSONEOF
-          echo "=== release.json ==="
           cat release.json
       - uses: softprops/action-gh-release@v2
         with:
