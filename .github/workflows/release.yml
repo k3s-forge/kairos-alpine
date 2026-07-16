@@ -27,6 +27,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -60,15 +61,12 @@ jobs:
 
       - name: Download ISO artifacts
         run: |
-          gh run download ${{ github.run_id }} -n "*.iso*" -D /tmp/iso || true
-          gh run download ${{ github.run_id }} -D /tmp/all || true
-          echo "=== All artifacts ==="
-          find /tmp/all -type f 2>/dev/null | head -20 || echo "none"
+          gh run download ${{ github.run_id }} -D /tmp/artifacts
+          echo "=== All downloaded ==="
+          find /tmp/artifacts -type f | head -30
           echo "=== ISO files ==="
-          find /tmp/iso -name "*.iso" -exec cp {} . \; 2>/dev/null || true
-          find /tmp/iso -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
-          find /tmp/all -name "*.iso" -exec cp {} . \; 2>/dev/null || true
-          find /tmp/all -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
+          find /tmp/artifacts -name "*.iso" -exec cp {} . \; 2>/dev/null || true
+          find /tmp/artifacts -name "*.sha256" -exec cp {} . \; 2>/dev/null || true
           ls -la *.iso *.sha256 2>/dev/null || echo "(no ISO files)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
