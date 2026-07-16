@@ -24,7 +24,9 @@ jobs:
       release: false
       registry_domain: "ghcr.io"
       summary_artifacts: true
-    secrets: inherit
+    secrets:
+      registry_username: ${{ github.actor }}
+      registry_password: ${{ secrets.GITHUB_TOKEN }}
 
   release:
     needs: build
