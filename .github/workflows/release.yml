@@ -1,4 +1,4 @@
-sha256:0000000000000000000000000000000000000000000000000000000000000000name: Build & Release Kairos OS
+name: Build & Release Kairos OS
 on:
   push:
     tags: ["v*"]
@@ -17,8 +17,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: "${{ github.actor }}"
-          password: "${{ secrets.GITHUB_TOKEN }}"
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
       - id: build-image
         uses: docker/build-push-action@v6
@@ -41,7 +41,6 @@ jobs:
         run: |
           DIGEST=$(docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ github.ref_name }} --format "{{json .}}" | jq -r ".manifest.digest")
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Image digest: ${DIGEST}"
       - uses: sigstore/cosign-installer@v3
       - name: Sign image
         run: cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
@@ -70,7 +69,7 @@ jobs:
               "digest": "${IMAGE_DIGEST}",
               "architectures": {
                 "amd64": "${IMAGE_DIGEST}",
-                "arm64": ""
+                "arm64": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
               },
               "verification": {
                 "cosign": {
