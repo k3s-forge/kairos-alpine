@@ -2,6 +2,9 @@ name: Build & Release Kairos OS
 on:
   push:
     tags: ["v*"]
+env:
+  REGISTRY: ghcr.io
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,16 +14,73 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Build release.json
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.kairos
+          push: true
+          build-args: |
+            KAIROS_VERSION=${{ github.ref_name }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Get image digest
+        id: digest
+        run: |
+          DIGEST=$(docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ github.ref_name }} --format "{{json .}}" | jq -r ".manifest.digest")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Image digest: ${DIGEST}"
+
+      - name: Build bootable artifacts (auroraboot)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker pull quay.io/kairos/auroraboot:v0.23.0
+          docker run --rm --privileged \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/dist:/tmp/auroraboot" \
+            quay.io/kairos/auroraboot:v0.23.0 \
+            --set "container_image=ghcr.io/${{ github.repository }}:${{ github.ref_name }}" \
+            --set "disk.size=20000" \
+            --set "state_dir=/tmp/auroraboot" \
+            --set "output.iso=true" \
+            --set "output.raw=true" \
+            --set "output.ipxe=true" \
+            --set "output.name=kairos-alpine-${{ github.ref_name }}"
+          ls -lh dist/
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign images
+        run: |
+          cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
+
+      - name: Build release manifest
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
           COMMIT="${{ github.sha }}"
           REPO="${{ github.repository }}"
-          REPO_LOWER=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          REPO_LOWER=$(echo "$REPO" | tr "[:upper:]" "[:lower:]")
           RUN_ID="${{ github.run_id }}"
-          VERSION=$(echo "$TAG" | sed 's/^v//' | sed 's/\.[0-9]*$/.0/')
+          VERSION=$(echo "$TAG" | sed "s/^v//" | sed "s/\\.[0-9]*$/.0/")
           CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          IMAGE_DIGEST="${{ steps.digest.outputs.digest }}"
           cat > release.json << JSONEOF
           {
             "schema": "transform.node-release/v1",
@@ -33,8 +93,7 @@ jobs:
             "image": {
               "oci": "ghcr.io/${REPO_LOWER}",
               "architectures": {
-                "amd64": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                "arm64": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                "amd64": "${IMAGE_DIGEST}"
               },
               "verification": {
                 "cosign": {
@@ -52,13 +111,21 @@ jobs:
               "runUrl": "https://github.com/${REPO}/actions/runs/${RUN_ID}"
             },
             "minimumDiskGb": 20,
-            "createdAt": "${CREATED}"
+            "createdAt": "${CREATED}",
+            "artifacts": {
+              "iso": "kairos-alpine-${TAG}.iso",
+              "raw": "kairos-alpine-${TAG}.raw",
+              "ipxe": "kairos-alpine-${TAG}-ipxe"
+            }
           }
           JSONEOF
           echo "=== release.json ==="
           cat release.json
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+
+      - uses: softprops/action-gh-release@v2
         with:
-          files: release.json
+          files: |
+            release.json
+            dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
