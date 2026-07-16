@@ -1,17 +1,23 @@
 # syntax=docker/dockerfile:1
 # Kairos Alpine image with Nomad + Podman + CNI + BIRD stack
 # Role-agnostic — cloud-config injected at boot via config_url=
+#
+# Compatible with kairos-factory-action:
+#   BASE_IMAGE   → passed by factory (default alpine:3.24 for local builds)
+#   KAIROS_FLAVOR_RELEASE → passed by factory (version for kairos-init)
+
+ARG BASE_IMAGE=alpine:3.24
 
 FROM quay.io/kairos/kairos-init:v0.16.1 AS kairos-init
 
-FROM alpine:3.24
+FROM ${BASE_IMAGE}
 
-ARG KAIROS_VERSION=v0.0.1
-ENV KAIROS_VERSION=${KAIROS_VERSION}
+ARG KAIROS_FLAVOR_RELEASE=v0.0.1
+ENV KAIROS_VERSION=${KAIROS_FLAVOR_RELEASE}
 
 # ── Kairos framework ────────────────────────────────────────────
 RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
-    /kairos-init -l debug --version "${KAIROS_VERSION}"
+    /kairos-init -l debug --version "${KAIROS_FLAVOR_RELEASE}"
 
 # ── Runtime dependencies ────────────────────────────────────────
 RUN apk add --no-cache \
@@ -87,4 +93,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 LABEL org.opencontainers.image.title="kairos-alpine"
 LABEL org.opencontainers.image.description="Kairos OS on Alpine with Nomad/Podman stack"
 LABEL org.opencontainers.image.source="https://github.com/k3s-forge/kairos-alpine"
-LABEL org.opencontainers.image.version="${KAIROS_VERSION}"
+LABEL org.opencontainers.image.version="${KAIROS_FLAVOR_RELEASE}"
