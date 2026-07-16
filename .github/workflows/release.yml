@@ -14,15 +14,12 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+          username: "${{ github.actor }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
       - uses: docker/setup-buildx-action@v3
-
       - id: build-image
         uses: docker/build-push-action@v6
         with:
@@ -39,37 +36,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Get image digest
         id: digest
         run: |
           DIGEST=$(docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ github.ref_name }} --format "{{json .}}" | jq -r ".manifest.digest")
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Image digest: ${DIGEST}"
-
-      - name: Build bootable artifacts (auroraboot)
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          docker pull quay.io/kairos/auroraboot:v0.23.0
-          docker run --rm --privileged \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/dist:/tmp/auroraboot" \
-            quay.io/kairos/auroraboot:v0.23.0 \
-            --set "container_image=ghcr.io/${{ github.repository }}:${{ github.ref_name }}" \
-            --set "disk.size=20000" \
-            --set "state_dir=/tmp/auroraboot" \
-            --set "output.iso=true" \
-            --set "output.raw=true" \
-            --set "output.ipxe=true" \
-            --set "output.name=kairos-alpine-${{ github.ref_name }}"
-          ls -lh dist/
-
       - uses: sigstore/cosign-installer@v3
-      - name: Sign images
+      - name: Sign image
         run: |
           cosign sign --yes "ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.digest }}"
-
       - name: Build release manifest
         run: |
           set -euo pipefail
@@ -78,7 +54,7 @@ jobs:
           REPO="${{ github.repository }}"
           REPO_LOWER=$(echo "$REPO" | tr "[:upper:]" "[:lower:]")
           RUN_ID="${{ github.run_id }}"
-          VERSION=$(echo "$TAG" | sed "s/^v//" | sed "s/\\.[0-9]*$/.0/")
+          VERSION=$(echo "$TAG" | sed "s/^v//")
           CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           IMAGE_DIGEST="${{ steps.digest.outputs.digest }}"
           cat > release.json << JSONEOF
@@ -92,16 +68,12 @@ jobs:
             },
             "image": {
               "oci": "ghcr.io/${REPO_LOWER}",
-              "architectures": {
-                "amd64": "${IMAGE_DIGEST}"
-              },
+              "digest": "${IMAGE_DIGEST}",
               "verification": {
                 "cosign": {
                   "issuer": "https://token.actions.githubusercontent.com",
                   "identity": "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
-                },
-                "attestations": true,
-                "sbom": "spdx-json"
+                }
               }
             },
             "provenance": {
@@ -110,22 +82,18 @@ jobs:
               "workflow": "release.yml",
               "runUrl": "https://github.com/${REPO}/actions/runs/${RUN_ID}"
             },
+            "boot": {
+              "method": "auroraboot",
+              "image": "quay.io/kairos/auroraboot:v0.23.0",
+              "command": "docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v $(pwd)/dist:/tmp/auroraboot quay.io/kairos/auroraboot:v0.23.0 --set container_image=ghcr.io/${REPO_LOWER}:${TAG} --set disk.size=20000 --set state_dir=/tmp/auroraboot --set output.iso=true --set output.raw=true"
+            },
             "minimumDiskGb": 20,
-            "createdAt": "${CREATED}",
-            "artifacts": {
-              "iso": "kairos-alpine-${TAG}.iso",
-              "raw": "kairos-alpine-${TAG}.raw",
-              "ipxe": "kairos-alpine-${TAG}-ipxe"
-            }
+            "createdAt": "${CREATED}"
           }
           JSONEOF
           echo "=== release.json ==="
           cat release.json
-
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release.json
-            dist/*
+          files: release.json
           generate_release_notes: true
-          fail_on_unmatched_files: true
