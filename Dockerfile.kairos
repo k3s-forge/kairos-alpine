@@ -70,6 +70,7 @@ RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/nul
 
 # ── Default cloud-config (overridden by config_url= at boot) ──
 RUN mkdir -p /system/oem && \
+    cp /53_reload_init.yaml /system/oem/53_reload_init.yaml && \
     cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
