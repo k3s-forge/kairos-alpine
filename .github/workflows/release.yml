@@ -45,8 +45,8 @@ jobs:
           context: .
           file: Dockerfile.kairos
           push: true
-          build-args: |
-            KAIROS_FLAVOR_RELEASE=${{ github.ref_name }}
+          build-args:
+            - "KAIROS_FLAVOR_RELEASE=${{ github.ref_name }}"
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
