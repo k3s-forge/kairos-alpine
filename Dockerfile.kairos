@@ -78,9 +78,8 @@ stages:
   network:
     - name: "Alpine DHCP on eth0"
       commands:
-        - ln -sf /etc/init.d/net.lo /etc/init.d/net.eth0
-        - rc-update add net.eth0 default
-        - rc-service net.eth0 start
+        - ifconfig eth0 up
+        - udhcpc -i eth0 -n -t 5
     - name: "Provision via config_url"
       commands:
         - /usr/local/bin/config-url-fetch.sh
