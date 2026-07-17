@@ -70,8 +70,11 @@ RUN printf '#!/bin/sh\nURL=$(grep -o "config_url=[^ ]*" /proc/cmdline 2>/dev/nul
     chmod +x /usr/local/bin/config-url-fetch.sh
 
 # ── Default cloud-config (overridden by config_url= at boot) ──
-RUN mkdir -p /system/oem && \
-    cat > /system/oem/40_dhcp.yaml << 'YEOF'
+RUN <<'DEOF'
+set -e
+mkdir -p /system/oem
+
+cat > /system/oem/40_dhcp.yaml << 'YEOF'
 #cloud-config
 stages:
   initramfs:
@@ -80,8 +83,10 @@ stages:
         - ifconfig eth0 up
         - udhcpc -i eth0 -n -t 5
 YEOF
-    cp /53_reload_init.yaml /system/oem/53_reload_init.yaml && \
-    cat > /system/oem/99_defaults.yaml << 'EOF'
+
+cp /53_reload_init.yaml /system/oem/53_reload_init.yaml
+
+cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
   initramfs:
@@ -98,6 +103,7 @@ stages:
           - curl
           - jq
 EOF
+DEOF
 
 # ── Healthcheck ──────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
