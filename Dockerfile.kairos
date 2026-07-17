@@ -75,11 +75,7 @@ RUN mkdir -p /system/oem && \
     cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
-  network:
-    - name: "Alpine DHCP on eth0"
-      commands:
-        - ifconfig eth0 up
-        - udhcpc -i eth0 -n -t 5
+  initramfs:
     - name: "Provision via config_url"
       commands:
         - /usr/local/bin/config-url-fetch.sh
