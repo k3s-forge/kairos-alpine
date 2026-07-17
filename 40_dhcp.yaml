@@ -1,0 +1,7 @@
+#cloud-config
+stages:
+  initramfs:
+    - name: "Alpine DHCP"
+      commands:
+        - ifconfig eth0 up
+        - udhcpc -i eth0 -n -t 5
