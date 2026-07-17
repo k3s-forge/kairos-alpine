@@ -129,7 +129,7 @@ stages:
       only_service_manager: "openrc"
       commands:
         - sed -i -e 's/tty1.*//g' /etc/inittab
-        - echo "tty1::respawn:/usr/bin/kairos-agent install > /dev/ttyS0 2>&1" >> /etc/inittab
+        - echo "tty1::respawn:/bin/sh -c 'sleep 10; exec /usr/bin/kairos-agent install > /dev/ttyS0 2>&1'" >> /etc/inittab
     - if: |
         (grep -q "interactive-install" /proc/cmdline || grep -q "install-mode-interactive" /proc/cmdline) &&         ([ -f /run/cos/live_mode ] || [ -f /run/cos/uki_install_mode ])
       only_service_manager: "systemd"
