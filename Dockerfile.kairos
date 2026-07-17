@@ -74,6 +74,77 @@ RUN <<'DEOF'
 set -e
 mkdir -p /system/oem
 
+# Override default 52_installer.yaml: kairos-agent install output to serial
+cat > /system/oem/52_installer.yaml << 'XEOF'
+name: "Start installer on tty1"
+stages:
+  initramfs:
+    - if: |
+        (grep -q "install-mode" /proc/cmdline || grep -q "nodepair.enable" /proc/cmdline ) &&         ([ -f /run/cos/live_mode ] || [ -f /run/cos/uki_install_mode ])
+      only_service_manager: "systemd"
+      files:
+        - path: /etc/systemd/system/kairos-webui.service
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=kairos webui installer
+            After=sysinit.target
+            [Service]
+            ExecStart=/usr/bin/kairos-agent webui
+            TimeoutStopSec=10s
+            [Install]
+            WantedBy=multi-user.target
+        - path: /etc/systemd/system/kairos-installer.service
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Unit]
+            Description=kairos installer
+            After=multi-user.target
+            [Service]
+            Type=simple
+            StandardInput=tty
+            StandardOutput=tty
+            LimitNOFILE=49152
+            ExecStartPre=-/bin/sh -c "dmesg -D"
+            TTYPath=/dev/tty1
+            RemainAfterExit=yes
+            ExecStartPre=-/usr/bin/kill -SIGRTMIN+21 1
+            ExecStart=/usr/bin/kairos-agent install
+            ExecStartPost=-/usr/bin/kill -SIGRTMIN+20 1
+            TimeoutStopSec=10s
+            [Install]
+            WantedBy=multi-user.target
+      commands:
+        - systemctl disable getty@tty1
+        - systemctl stop getty@tty1
+        - systemctl mask getty@tty1
+        - systemctl enable kairos-installer
+        - systemctl enable kairos-webui
+    - if: |
+        (grep -q "install-mode" /proc/cmdline || grep -q "nodepair.enable" /proc/cmdline ) &&         ([ -f /run/cos/live_mode ] || [ -f /run/cos/uki_install_mode ])
+      only_service_manager: "openrc"
+      commands:
+        - sed -i -e 's/tty1.*//g' /etc/inittab
+        - echo "tty1::respawn:/usr/bin/kairos-agent install > /dev/ttyS0 2>&1" >> /etc/inittab
+    - if: |
+        (grep -q "interactive-install" /proc/cmdline || grep -q "install-mode-interactive" /proc/cmdline) &&         ([ -f /run/cos/live_mode ] || [ -f /run/cos/uki_install_mode ])
+      only_service_manager: "systemd"
+      commands:
+        - systemctl disable getty@tty1
+        - systemctl stop getty@tty1
+        - systemctl mask getty@tty1
+    - if: |
+        (grep -q "interactive-install" /proc/cmdline || grep -q "install-mode-interactive" /proc/cmdline) &&         ([ -f /run/cos/live_mode ] || [ -f /run/cos/uki_install_mode ])
+      only_service_manager: "openrc"
+      commands:
+        - sed -i -e 's/tty1.*//g' /etc/inittab
+        - echo "tty1::respawn:/usr/bin/kairos-agent install" >> /etc/inittab
+XEOF
+
 cat > /system/oem/40_dhcp.yaml << 'YEOF'
 #cloud-config
 stages:
