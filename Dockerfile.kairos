@@ -81,7 +81,6 @@ stages:
         - udhcpc -i eth0 -n -t 5
 YEOF
     cp /53_reload_init.yaml /system/oem/53_reload_init.yaml && \
-    cp /53_reload_init.yaml /system/oem/53_reload_init.yaml && \
     cat > /system/oem/99_defaults.yaml << 'EOF'
 #cloud-config
 stages:
