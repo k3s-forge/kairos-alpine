@@ -60,3 +60,24 @@ jobs:
         run: |
           echo "## Image built" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body: |
+            ## tinycloud ${{ steps.version.outputs.version }}
+            
+            OCI: `ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}`
+            
+            Components:
+            - Alpine 3.21
+            - Nomad 2.0.3+ent.musl
+            - Nebula 1.10.0
+            - Podman + CNI 1.6.2
+            - BIRD 2.15.1
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
