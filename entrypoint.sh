@@ -2,350 +2,356 @@
 set -euo pipefail
 
 # ─── tinycloud — self-bootstrapping edge node agent ───
+# Supports two modes:
+#   AUTO:  WORKER_URL + WORKER_TOKEN set → pulls identity, Nebula certs, config
+#   LOCAL: certs pre-mounted at /var/lib/nebula/
+#
 # Bootstrap: Nebula + Podman socket + CNI + Nomad client
 # Steady-state: submits BIRD system job → Nomad manages everything
 
-: "${NOMAD_SERVER:?NOMAD_SERVER required}"
-: "${NEBULA_LIGHTHOUSE:?NEBULA_LIGHTHOUSE required}"
+: "${NOMAD_SERVER:?NOMAD_SERVER required (or provide WORKER_URL+WORKER_TOKEN)}"
+: "${NEBULA_LIGHTHOUSE:?NEBULA_LIGHTHOUSE required (or provide WORKER_URL+WORKER_TOKEN)}"
 HOSTNAME="${HOSTNAME:-$(hostname)}"
 MODE="${1:-bootstrap}"
 
 log() { echo "[tinycloud] $(date -Iseconds) $*"; }
+die()  { log "FATAL: $*"; exit 1; }
+
+# ─── RSA JWK extraction (pure shell, no Python/Node) ───
+# Extracts the public key from an RSA PEM and outputs a JWK object.
+# Usage: rsa_pubkey_to_jwk </path/to/key.pem>
+rsa_pubkey_to_jwk() {
+    local privkey="$1"
+    local pubpem="/tmp/rsa-pub-$$.pem"
+
+    openssl rsa -in "$privkey" -pubout -out "$pubpem" 2>/dev/null || {
+        die "failed to extract public key"
+    }
+
+    local mod_hex
+    mod_hex=$(openssl rsa -pubin -in "$pubpem" -modulus -noout 2>/dev/null | sed 's/Modulus=//')
+    rm -f "$pubpem"
+
+    if [ -z "$mod_hex" ]; then
+        die "failed to read RSA modulus"
+    fi
+
+    local mod_b64
+    # hex → binary (printf+sed, no xxd needed) → base64url
+    mod_b64=$(printf "$(echo "$mod_hex" | sed 's/\(..\)/\\x\1/g')" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+    if [ -z "$mod_b64" ]; then
+        die "failed to encode modulus"
+    fi
+
+    printf '{"kty":"RSA","alg":"RSA-OAEP-256","n":"%s","e":"AQAB","ext":true,"key_ops":["encrypt"]}' "$mod_b64"
+}
+
+# ─── Worker API call with retry ───
+worker_get() {
+    local path="$1" auth="${2:-}" max_retries="${3:-3}"
+    local code
+    for i in $(seq 1 "$max_retries"); do
+        if [ -n "$auth" ]; then
+            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
+                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
+                -H "Authorization: Bearer $auth" \
+                "$WORKER_URL$path" 2>/dev/null || echo "000")
+        else
+            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
+                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
+                "$WORKER_URL$path" 2>/dev/null || echo "000")
+        fi
+        if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+            cat /tmp/worker-resp-$$.txt
+            rm -f /tmp/worker-resp-$$.txt
+            return 0
+        fi
+        log "worker GET $path → HTTP $code, retry $i/$max_retries"
+        sleep 2
+    done
+    rm -f /tmp/worker-resp-$$.txt
+    return 1
+}
+
+worker_post() {
+    local path="$1" body="$2" auth="${3:-}" max_retries="${4:-3}"
+    local code
+    for i in $(seq 1 "$max_retries"); do
+        if [ -n "$auth" ]; then
+            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
+                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
+                -H "Authorization: Bearer $auth" \
+                -H "Content-Type: application/json" \
+                -d "$body" \
+                "$WORKER_URL$path" 2>/dev/null || echo "000")
+        else
+            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
+                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
+                -H "Content-Type: application/json" \
+                -d "$body" \
+                "$WORKER_URL$path" 2>/dev/null || echo "000")
+        fi
+        if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+            cat /tmp/worker-resp-$$.txt
+            rm -f /tmp/worker-resp-$$.txt
+            return 0
+        fi
+        log "worker POST $path → HTTP $code, retry $i/$max_retries"
+        sleep 2
+    done
+    rm -f /tmp/worker-resp-$$.txt
+    return 1
+}
 
 # ─── step 1: identity ───
 resolve_identity() {
     log "resolving identity"
 
-    # Worker mode: pull certs + config from transform API
+    # ── AUTO mode: pull everything from Worker ──
     if [[ -n "${WORKER_URL:-}" && -n "${WORKER_TOKEN:-}" ]]; then
-        log "pulling identity from $WORKER_URL"
+        log "AUTO mode: pulling identity from $WORKER_URL"
 
-        # 1. Bootstrap — get encrypted identity + cluster config
-        local pubkey=""
-        if [[ -f /var/lib/nebula/node.pub ]]; then
-            pubkey=$(cat /var/lib/nebula/node.pub)
+        # 1a. Generate RSA-4096 key pair for Worker encryption
+        if [[ ! -f /var/lib/nebula/node.key ]]; then
+            log "generating RSA-4096 key pair"
+            mkdir -p /var/lib/nebula
+            openssl genrsa -out /var/lib/nebula/node.key 4096 2>/dev/null
         fi
 
+        # 1b. Extract public key as JWK
+        local jwk
+        jwk=$(rsa_pubkey_to_jwk /var/lib/nebula/node.key)
+        log "public key JWK: ${jwk:0:80}..."
+
+        # 1c. Bootstrap — one-shot enrollment token
+        log "calling /api/v1/bootstrap"
         local bootstrap
-        bootstrap=$(curl -sfS --connect-timeout 10 --max-time 30 \
-            -H "Authorization: Bearer $WORKER_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"publicKey\":$pubkey}" \
-            "$WORKER_URL/api/v1/bootstrap" 2>&1) || {
-            log "WARN: bootstrap failed: $(echo "$bootstrap" | head -1)"
-            log "  falling back to local certs"
+        bootstrap=$(worker_post "/api/v1/bootstrap" "$jwk" "$WORKER_TOKEN") || {
+            die "bootstrap failed — enrollment token may be expired or already consumed"
         }
 
-        if [[ -n "$bootstrap" ]]; then
-            NODE_TOKEN=$(echo "$bootstrap" | jq -r '.nodeToken // empty' 2>/dev/null)
-            CLUSTER_ID=$(echo "$bootstrap" | jq -r '.identity.clusterId // empty' 2>/dev/null)
+        NODE_TOKEN=$(echo "$bootstrap" | jq -r '.nodeToken // empty')
+        NODE_ID=$(echo "$bootstrap" | jq -r '.identity.nodeId // empty')
+        CLUSTER_ID=$(echo "$bootstrap" | jq -r '.identity.clusterId // empty')
 
-            # 2. Cluster config
-            if [[ -n "$CLUSTER_ID" ]]; then
-                local cc
-                cc=$(curl -sfS --connect-timeout 5 --max-time 10 \
-                    "$WORKER_URL/api/v1/clusters/config?clusterId=$CLUSTER_ID" 2>&1) || true
-
-                if [[ -n "$cc" ]]; then
-                    export NOMAD_SERVER="${NOMAD_SERVER:-$(echo "$cc" | jq -r '.nomad_server // empty')}"
-                    export NEBULA_LIGHTHOUSE="${NEBULA_LIGHTHOUSE:-$(echo "$cc" | jq -r '.nebula.lighthouse // empty')}"
-                    export NEBULA_MTU="${NEBULA_MTU:-$(echo "$cc" | jq -r '.nebula.mtu // empty')}"
-                    export NEBULA_PORT="${NEBULA_PORT:-$(echo "$cc" | jq -r '.nebula.port // empty')}"
-                    export CNI_SUBNET="${CNI_SUBNET:-$(echo "$cc" | jq -r '.bgp.cni_subnet // empty')}"
-
-                    # Static host map
-                    local shm
-                    shm=$(echo "$cc" | jq -r '.nebula.static_host_map // {} | to_entries | map("\(.key)=\(.value)") | join(",")' 2>/dev/null)
-                    export STATIC_HOST_MAP="${STATIC_HOST_MAP:-$shm}"
-                fi
-            fi
-
-            # 3. Nebula CA cert
-            if [[ -n "$CLUSTER_ID" ]]; then
-                curl -sfS --connect-timeout 5 --max-time 10 \
-                    "$WORKER_URL/api/v1/clusters/nebula/ca?clusterId=$CLUSTER_ID" \
-                    -o /var/lib/nebula/ca.crt 2>/dev/null || true
-            fi
-
-            # 4. Host cert + key (authenticated with node token)
-            if [[ -n "$CLUSTER_ID" && -n "$NODE_TOKEN" ]]; then
-                local hc
-                hc=$(curl -sfS --connect-timeout 5 --max-time 10 \
-                    -H "Authorization: Bearer $NODE_TOKEN" \
-                    "$WORKER_URL/api/v1/clusters/nebula/host-cert?clusterId=$CLUSTER_ID" 2>&1) || true
-
-                if [[ -n "$hc" ]]; then
-                    echo "$hc" | jq -r '.cert' > /var/lib/nebula/host.crt 2>/dev/null
-                    echo "$hc" | jq -r '.key' > /var/lib/nebula/host.key 2>/dev/null
-                    chmod 600 /var/lib/nebula/host.key
-                    log "host cert pulled from Worker"
-                fi
-            fi
+        if [ -z "$NODE_TOKEN" ] || [ -z "$NODE_ID" ]; then
+            die "bootstrap response missing nodeToken or identity"
         fi
-    fi
+        log "identity: node=$NODE_ID cluster=$CLUSTER_ID"
 
-    # Skip Nebula if lighthouse is set to "skip"
-    if [[ "${NEBULA_LIGHTHOUSE:-}" == "skip" ]]; then
-        log "Nebula disabled (NEBULA_LIGHTHOUSE=skip)"
+        # 1d. Cluster config from bootstrap response
+        local cluster
+        cluster=$(echo "$bootstrap" | jq -r '.cluster // empty')
+        if [ -n "$cluster" ] && [ "$cluster" != "null" ]; then
+            export NOMAD_SERVER="${NOMAD_SERVER:-$(echo "$cluster" | jq -r '.nomad_server // empty')}"
+            export NEBULA_LIGHTHOUSE="${NEBULA_LIGHTHOUSE:-$(echo "$cluster" | jq -r '.nebula.lighthouse // empty')}"
+            export NEBULA_MTU="${NEBULA_MTU:-$(echo "$cluster" | jq -r '.nebula.mtu // empty')}"
+            export NEBULA_PORT="${NEBULA_PORT:-$(echo "$cluster" | jq -r '.nebula.port // empty')}"
+            export CNI_SUBNET="${CNI_SUBNET:-$(echo "$cluster" | jq -r '.bgp.cni_subnet // empty')}"
+
+            # Static host map: { "IP": ["host:port"], ... } → "IP=host:port,IP=host:port"
+            local shm
+            shm=$(echo "$cluster" | jq -r '
+                .nebula.static_host_map // {} |
+                to_entries |
+                map("\(.key)=\(.value[0])") |
+                join(",")
+            ' 2>/dev/null)
+            export STATIC_HOST_MAP="${STATIC_HOST_MAP:-$shm}"
+        fi
+
+        # 1e. Nebula CA cert
+        log "pulling Nebula CA cert"
+        worker_get "/api/v1/clusters/nebula/ca?clusterId=$CLUSTER_ID" > /var/lib/nebula/ca.crt || {
+            die "failed to pull CA cert"
+        }
+        log "CA cert saved ($(wc -c < /var/lib/nebula/ca.crt) bytes)"
+
+        # 1f. Nebula host cert + key (authenticated with nodeToken)
+        log "pulling Nebula host cert"
+        local hostCert
+        hostCert=$(worker_get "/api/v1/clusters/nebula/host-cert?clusterId=$CLUSTER_ID" "$NODE_TOKEN") || {
+            die "failed to pull host cert"
+        }
+
+        echo "$hostCert" | jq -r '.cert // empty' > /var/lib/nebula/host.crt
+        echo "$hostCert" | jq -r '.key // empty' > /var/lib/nebula/host.key
+        chmod 600 /var/lib/nebula/host.key
+
+        if [ ! -s /var/lib/nebula/host.crt ] || [ ! -s /var/lib/nebula/host.key ]; then
+            die "host cert or key empty"
+        fi
+        log "host cert saved"
+
+        # Store node identity for later use
+        echo "$bootstrap" | jq '.identity' > /var/lib/nebula/identity.json
+        echo "$NODE_TOKEN" > /var/lib/nebula/node-token
+        chmod 600 /var/lib/nebula/node-token
+
         return 0
     fi
 
-    # File mode: certs must be mounted at /etc/nebula/
-    if [[ ! -f /etc/nebula/host.crt ]] && [[ ! -f /var/lib/nebula/host.crt ]]; then
-        log "FATAL: no host cert at /etc/nebula/host.crt or /var/lib/nebula/host.crt"
-        log "  mount certs or set WORKER_URL/WORKER_TOKEN"
-        exit 1
+    # ── LOCAL mode: certs are pre-mounted ──
+    if [ -f /var/lib/nebula/host.crt ] && [ -f /var/lib/nebula/host.key ] && [ -f /var/lib/nebula/ca.crt ]; then
+        log "LOCAL mode: using pre-mounted certs"
+        return 0
     fi
+
+    die "no WORKER_URL/WORKER_TOKEN and no pre-mounted certs — cannot resolve identity"
 }
 
-# ─── step 2: nebula ───
-start_nebula() {
-    if [[ "${NEBULA_LIGHTHOUSE:-}" == "skip" ]]; then
-        log "Nebula skipped (NEBULA_LIGHTHOUSE=skip)"
-        return 0
+# ─── step 2: Nebula config ───
+generate_nebula_config() {
+    log "generating Nebula config"
+    local config="/etc/nebula/config.yml"
+
+    local mtu="${NEBULA_MTU:-1300}"
+    local port="${NEBULA_PORT:-4242}"
+
+    # Static host map as YAML
+    local shm_yaml=""
+    if [ -n "${STATIC_HOST_MAP:-}" ]; then
+        IFS=',' read -ra SHM_ENTRIES <<< "$STATIC_HOST_MAP"
+        for entry in "${SHM_ENTRIES[@]}"; do
+            local ip="${entry%%=*}"
+            local addr="${entry#*=}"
+            shm_yaml="$shm_yaml"$'\n'"  \"$ip\": [\"$addr\"]"
+        done
     fi
 
-    log "starting Nebula (lighthouse=$NEBULA_LIGHTHOUSE)"
-
-    # Config goes to writable dir; certs are read from /etc/nebula
-    local config_dir="${NEBULA_CONFIG_DIR:-/var/lib/nebula}"
-    mkdir -p "$config_dir"
-
-    if [[ ! -f "$config_dir/config.yml" ]]; then
-        # static_host_map: maps Nebula IPs to real addresses
-        #   format: STATIC_HOST_MAP="NEB_IP=REAL_ADDR,NEB_IP2=REAL_ADDR2,..."
-        local map_block=""
-        if [[ -n "${STATIC_HOST_MAP:-}" ]]; then
-            map_block="static_host_map:"
-            IFS=',' read -ra PAIRS <<< "$STATIC_HOST_MAP"
-            for pair in "${PAIRS[@]}"; do
-                IFS='=' read -r neb_ip real_addr <<< "$pair"
-                map_block+=$'\n'"  \"$neb_ip\": [\"$real_addr\"]"
-            done
-        fi
-
-        cat > "$config_dir/config.yml" <<YAML
+    cat > "$config" <<YAML
 pki:
-  ca: /etc/nebula/ca.crt
-  cert: /etc/nebula/host.crt
-  key: /etc/nebula/host.key
-
-$map_block
+  ca: /var/lib/nebula/ca.crt
+  cert: /var/lib/nebula/host.crt
+  key: /var/lib/nebula/host.key
 
 lighthouse:
-  am_lighthouse: ${AM_LIGHTHOUSE:-false}
+  am_lighthouse: false
   interval: 60
-  hosts: ["$NEBULA_LIGHTHOUSE"]
+  hosts:
+    - "$NEBULA_LIGHTHOUSE"
+  local_allow_list:
+    interfaces:
+      lo: false
+    "10.77.0.0/16": false
 
 listen:
   host: 0.0.0.0
-  port: ${NEBULA_PORT:-4242}
-
-punchy:
-  punch: ${PUNCH_ENABLE:-false}
+  port: $port
 
 tun:
   dev: nebula1
-  mtu: ${NEBULA_MTU:-1300}
+  mtu: $mtu
   tx_queue: 500
-  drop_local_broadcast: true
-  drop_multicast: true
+  drop_local_broadcast: false
+  drop_multicast: false
   use_system_route_table: true
+  use_system_route_table_buffer_size: 1048576
 
 firewall:
   outbound:
     - port: any
       proto: any
       host: any
+    - port: any
+      proto: any
+      host: any
+      local_cidr: 10.77.0.0/16
   inbound:
     - port: any
       proto: any
       host: any
+    - port: any
+      proto: any
+      host: any
+      local_cidr: 10.77.0.0/16
+
+punchy:
+  punch: false
+
+preferred_ranges:
+  - 192.168.100.0/24
+
+static_host_map:$shm_yaml
 YAML
+
+    log "Nebula config written ($(wc -c < "$config") bytes)"
+}
+
+# ─── step 3: start Nebula ───
+start_nebula() {
+    log "starting Nebula"
+
+    # Kill any existing Nebula
+    killall nebula 2>/dev/null || true
+    sleep 1
+
+    nebula -config /etc/nebula/config.yml &
+    local pid=$!
+    sleep 3
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        die "Nebula failed to start"
     fi
 
-    nebula -config "$config_dir/config.yml" &
-    NEBULA_PID=$!
-
-    # Wait for TUN
+    # Wait for TUN device
     for i in $(seq 1 30); do
-        ip addr show nebula1 >/dev/null 2>&1 && break
-        sleep 0.5
+        if ip link show nebula1 >/dev/null 2>&1; then
+            log "Nebula TUN (nebula1) ready"
+            return 0
+        fi
+        sleep 1
     done
-    ip addr show nebula1 >/dev/null 2>&1 || {
-        log "FATAL: Nebula TUN did not come up"
-        exit 1
-    }
-    NEBULA_IP=$(ip -4 addr show nebula1 | awk '/inet /{print $2}' | cut -d/ -f1)
-    log "Nebula up: PID=$NEBULA_PID IP=$NEBULA_IP"
+    die "Nebula TUN device not created after 30s"
 }
 
-# ─── step 3: podman socket ───
-start_podman_socket() {
+# ─── step 4: start Podman ───
+start_podman() {
     log "starting Podman socket"
-    mkdir -p /run/podman
-
-    # Kill stale socket
-    rm -f /run/podman/podman.sock
-
-    podman system service --time=0 unix:///run/podman/podman.sock &
-    PODMAN_PID=$!
-
-    # Wait for socket
-    for i in $(seq 1 20); do
-        [[ -S /run/podman/podman.sock ]] && break
-        sleep 0.3
-    done
-    [[ -S /run/podman/podman.sock ]] || {
-        log "FATAL: Podman socket did not appear"
-        exit 1
-    }
-    log "Podman socket ready: PID=$PODMAN_PID"
+    podman system service --time=0 tcp:0.0.0.0:8080 &
+    sleep 2
 }
 
-# ─── step 4: CNI config ───
-deploy_cni() {
-    local cni_name="${CNI_NAME:-nomad-ptp}"
-    local cni_subnet="${CNI_SUBNET:-10.77.200.0/24}"
-    local cni_dir="${CNI_CONFIG_DIR:-/opt/cni/config}"
-
-    log "deploying CNI: $cni_name ($cni_subnet)"
-
-    mkdir -p "$cni_dir"
-    cat > "$cni_dir/${cni_name}.conflist" <<JSON
-{
-  "cniVersion": "1.0.0",
-  "name": "$cni_name",
-  "plugins": [
-    {
-      "type": "ptp",
-      "ipam": {
-        "type": "host-local",
-        "subnet": "$cni_subnet",
-        "routes": [{"dst": "0.0.0.0/0"}]
-      }
-    },
-    {"type": "firewall"}
-  ]
-}
-JSON
-    log "CNI deployed: $cni_dir/${cni_name}.conflist"
-}
-
-# ─── step 5: Nomad client ───
+# ─── step 5: start Nomad ───
 start_nomad() {
-    log "starting Nomad client → $NOMAD_SERVER"
-    mkdir -p /var/lib/nomad
-
+    log "starting Nomad client"
     cat > /etc/nomad.d/client.hcl <<HCL
-data_dir  = "/var/lib/nomad"
-log_level = "INFO"
-name      = "$HOSTNAME"
-
 client {
-  enabled           = true
-  servers           = ["$NOMAD_SERVER"]
-  network_interface = "${NOMAD_IFACE:-eth0}"
-  cni_path          = "${CNI_BIN_DIR:-/opt/cni/bin}"
-  cni_config_dir    = "${CNI_CONFIG_DIR:-/opt/cni/config}"
+  enabled = true
+  server_join {
+    retry_join = ["$NOMAD_SERVER"]
+  }
+  network_interface = "nebula1"
 }
-
-plugin_dir = "/opt/nomad/plugins"
-
-plugin "raw_exec" {
-  config { enabled = true }
-}
-
-plugin "nomad-driver-podman" {
+plugin "podman" {
   config {
-    volumes {
-      enabled = false
-    }
+    socket_path = "tcp://127.0.0.1:8080"
   }
 }
 HCL
 
-    nomad agent -config=/etc/nomad.d/client.hcl &
-    NOMAD_PID=$!
-
-    # Expose env vars for nomad commands
-    export NOMAD_ADDR="http://${NOMAD_SERVER}:4646"
-
-    # Wait for client to register
-    local node_id=""
-    for i in $(seq 1 60); do
-        node_id=$(nomad node status -self -json 2>/dev/null | jq -r '.ID // empty' 2>/dev/null || true)
-        [[ -n "$node_id" ]] && break
-        sleep 1
-    done
-
-    if [[ -z "$node_id" ]]; then
-        log "WARN: Nomad client registration timeout (continuing)"
-    else
-        log "Nomad client ready: PID=$NOMAD_PID node=$node_id"
-    fi
-}
-
-# ─── step 6: submit Nomad system jobs ───
-submit_jobs() {
-    export NOMAD_ADDR="${NOMAD_ADDR:-http://${NOMAD_SERVER}:4646}"
-
-    local jobs_dir="${1:-/etc/nomad-jobs}"
-
-    if [[ ! -d "$jobs_dir" ]]; then
-        log "no nomad-jobs dir at $jobs_dir, skipping job submission"
-        return 0
-    fi
-
-    for jobfile in "$jobs_dir"/*.nomad; do
-        [[ -f "$jobfile" ]] || continue
-        local jobname
-        jobname=$(basename "$jobfile" .nomad)
-
-        if nomad job status "$jobname" >/dev/null 2>&1; then
-            log "job $jobname already running"
-            continue
-        fi
-
-        log "submitting $jobname"
-        nomad job run -detach "$jobfile" 2>&1 || {
-            log "WARN: failed to submit $jobname"
-            continue
-        }
-        log "$jobname submitted"
-    done
+    nomad agent -config=/etc/nomad.d &
+    sleep 3
 }
 
 # ─── main ───
-case "$MODE" in
-    bootstrap)
-        log "=== tinycloud bootstrap: $HOSTNAME ==="
-        resolve_identity
+echo "=== tinycloud v0.5.0 ==="
+
+resolve_identity
+generate_nebula_config
+
+if [ "$MODE" = "bootstrap" ]; then
+    if ! ip link show nebula1 >/dev/null 2>&1; then
         start_nebula
-        start_podman_socket
-        deploy_cni
-        start_nomad
-        submit_jobs
-        log "=== bootstrap complete: $HOSTNAME ==="
-        ;;
-    submit-only)
-        log "=== tinycloud submit-only ==="
-        submit_jobs
-        ;;
-    daemon)
-        log "=== tinycloud daemon mode ==="
-        resolve_identity
-        start_nebula
-        start_podman_socket
-        deploy_cni
-        start_nomad
-        submit_jobs
-        log "=== daemon ready, blocking ==="
-        # Block on background processes
-        wait
-        ;;
-    *)
-        log "usage: tinycloud-init {bootstrap|daemon|submit-only}"
-        exit 1
-        ;;
-esac
+    fi
+    start_podman
+    start_nomad
+    log "bootstrap complete — handing off to Nomad"
+elif [ "$MODE" = "certs-only" ]; then
+    log "certs-only mode — identity resolved, services not started"
+else
+    log "unknown mode: $MODE"
+fi
+
+log "done"
+exec sleep infinity
