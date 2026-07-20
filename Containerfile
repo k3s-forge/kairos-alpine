@@ -1,19 +1,13 @@
 # tinycloud — self-bootstrapping edge node agent
-# Stage 1: Build Nomad from source (CGO_ENABLED=0 → pure Go static, no glibc)
-# Stage 2: Alpine runtime with Nebula + Podman + CNI + Nomad
+# Single-stage Alpine build using pre-built musl binaries from:
+#   - k3s-forge/nomad-musl (Nomad client)
+#   - k3s-forge/nomad-driver-podman-musl (Podman task driver)
+#   - slackhq/nebula (static binary)
+#   - containernetworking/plugins (CNI plugins)
 
-# ── Stage 1: Build Nomad ──
-FROM docker.io/library/golang:1.24-alpine AS nomad-builder
-ARG NOMAD_VER=v2.0.3
-RUN apk add --no-cache git make bash
-RUN git clone --depth 1 --branch "${NOMAD_VER}" https://github.com/hashicorp/nomad.git /src/nomad
-WORKDIR /src/nomad
-RUN CGO_ENABLED=0 go build -o /usr/local/bin/nomad \
-    -ldflags="-s -w -X github.com/hashicorp/nomad/version.Version=${NOMAD_VER#v}" .
-
-# ── Stage 2: Runtime ──
 FROM docker.io/library/alpine:3.21
 
+# ── system deps ──
 RUN apk add --no-cache \
     bash curl jq iproute2 iptables nftables \
     podman podman-remote conmon crun netavark aardvark-dns \
@@ -27,8 +21,16 @@ RUN wget -qO /tmp/nebula.tar.gz "https://github.com/slackhq/nebula/releases/down
     chmod +x /usr/local/bin/nebula /usr/local/bin/nebula-cert && \
     rm /tmp/nebula.tar.gz
 
-# ── Nomad (CGO_ENABLED=0 static from Stage 1) ──
-COPY --from=nomad-builder /usr/local/bin/nomad /usr/local/bin/nomad
+# ── Nomad (static musl binary from k3s-forge/nomad-musl) ──
+ARG NOMAD_VER=v2.0.4-musl
+RUN wget -qO /usr/local/bin/nomad "https://github.com/k3s-forge/nomad-musl/releases/download/${NOMAD_VER}/nomad" && \
+    chmod +x /usr/local/bin/nomad && \
+    /usr/local/bin/nomad version
+
+# ── Nomad Podman driver (static musl binary) ──
+ARG PODMAN_DRIVER_VER=v0.6.5-musl
+RUN wget -qO /opt/nomad/plugins/nomad-driver-podman "https://github.com/k3s-forge/nomad-driver-podman-musl/releases/download/${PODMAN_DRIVER_VER}/nomad-driver-podman" && \
+    chmod +x /opt/nomad/plugins/nomad-driver-podman
 
 # ── CNI plugins ──
 ARG CNI_VER=1.6.2
