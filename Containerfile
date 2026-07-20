@@ -1,15 +1,23 @@
 # tinycloud — self-bootstrapping edge node agent
-# Base: Debian Bookworm (glibc) — Nomad requires glibc
-# Bootstrap: Nebula + Podman + CNI + Nomad client
+# Stage 1: Build Nomad from source (CGO_ENABLED=0 → pure Go static, no glibc)
+# Stage 2: Alpine runtime with Nebula + Podman + CNI + Nomad
 
-FROM docker.io/library/debian:bookworm-slim
+# ── Stage 1: Build Nomad ──
+FROM docker.io/library/golang:1.24-alpine AS nomad-builder
+ARG NOMAD_VER=v2.0.3
+RUN apk add --no-cache git make bash
+RUN git clone --depth 1 --branch "${NOMAD_VER}" https://github.com/hashicorp/nomad.git /src/nomad
+WORKDIR /src/nomad
+RUN CGO_ENABLED=0 go build -o /usr/local/bin/nomad \
+    -ldflags="-s -w -X github.com/hashicorp/nomad/version.Version=${NOMAD_VER#v}" .
 
-# ── system deps ──
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash curl jq iproute2 iptables nftables wget ca-certificates unzip \
-    podman crun netavark aardvark-dns \
-    bird && \
-    rm -rf /var/lib/apt/lists/* && \
+# ── Stage 2: Runtime ──
+FROM docker.io/library/alpine:3.21
+
+RUN apk add --no-cache \
+    bash curl jq iproute2 iptables nftables \
+    podman podman-remote conmon crun netavark aardvark-dns \
+    bird ca-certificates openssl && \
     mkdir -p /run/podman /opt/cni/bin /opt/cni/config /var/lib/nomad /etc/nomad.d /opt/nomad/plugins /var/lib/nebula /etc/nebula
 
 # ── Nebula (static binary from GitHub) ──
@@ -19,13 +27,8 @@ RUN wget -qO /tmp/nebula.tar.gz "https://github.com/slackhq/nebula/releases/down
     chmod +x /usr/local/bin/nebula /usr/local/bin/nebula-cert && \
     rm /tmp/nebula.tar.gz
 
-# ── Nomad (glibc binary from Hashicorp) ──
-ARG NOMAD_VER=2.0.3+ent
-RUN wget -qO /tmp/nomad.zip "https://releases.hashicorp.com/nomad/${NOMAD_VER}/nomad_${NOMAD_VER}_linux_amd64.zip" && \
-    unzip -o /tmp/nomad.zip nomad -d /usr/local/bin/ && \
-    chmod +x /usr/local/bin/nomad && \
-    rm /tmp/nomad.zip && \
-    /usr/local/bin/nomad version
+# ── Nomad (CGO_ENABLED=0 static from Stage 1) ──
+COPY --from=nomad-builder /usr/local/bin/nomad /usr/local/bin/nomad
 
 # ── CNI plugins ──
 ARG CNI_VER=1.6.2
