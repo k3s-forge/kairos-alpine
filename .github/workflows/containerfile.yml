@@ -42,6 +42,7 @@ jobs:
           fi
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -56,10 +57,53 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Generate release.json
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          cat > release.json << JSONEOF
+          {
+            "schema": "transform.node-release/v1",
+            "version": "${VERSION}",
+            "kairos": {
+              "version": "v3.21",
+              "flavor": "alpine",
+              "baseVersion": "3.21"
+            },
+            "image": {
+              "oci": "ghcr.io/${{ github.repository }}:${VERSION}",
+              "digest": "${DIGEST}",
+              "architectures": {
+                "amd64": "${DIGEST}"
+              },
+              "verification": {
+                "cosign": {
+                  "issuer": "https://token.actions.githubusercontent.com",
+                  "identity": "${{ github.server_url }}/${{ github.repository }}/.github/workflows/containerfile.yml@${{ github.ref }}"
+                },
+                "attestations": true,
+                "sbom": "spdx-json"
+              }
+            },
+            "provenance": {
+              "repository": "${{ github.repository }}",
+              "commit": "${{ github.sha }}",
+              "workflow": "containerfile.yml",
+              "runUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            },
+            "minimumDiskGb": 10,
+            "createdAt": "${NOW}"
+          }
+          JSONEOF
+        shell: bash
+
       - name: Report digest
         run: |
           echo "## Image built" >> $GITHUB_STEP_SUMMARY
           echo "- \`ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Digest: \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -70,6 +114,7 @@ jobs:
             ## tinycloud ${{ steps.version.outputs.version }}
             
             OCI: `ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}`
+            Digest: `${{ steps.build.outputs.digest }}`
             
             Components:
             - Alpine 3.21
@@ -77,6 +122,7 @@ jobs:
             - Nebula 1.10.0
             - Podman + CNI 1.6.2
             - BIRD 2.15.1
+          files: release.json
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
