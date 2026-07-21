@@ -1,0 +1,141 @@
+<!-- Takeover Card → insert after tiny-cloud card in nodes/[id].astro -->
+<div class="card">
+  <div class="card-header">
+    <span>Full-Disk Takeover</span>
+    <button class="btn btn-primary btn-sm" onclick="generateTakeover()" id="toBtn">Generate</button>
+  </div>
+  <div class="card-body">
+    <p class="dim sm">Install kairos-alpine to disk via rescue mode. <strong>Wipes all data on the target device.</strong></p>
+    <div class="form-group mt">
+      <label class="form-label">Target Device</label>
+      <select id="toDevice" class="form-select">
+        {disks.length > 0 ? disks.map((d: any) => (
+          <option value={'/dev/' + (d.name || 'sda')}>{'/dev/' + (d.name || 'sda')} {d.size_bytes ? '— ' + Math.round(d.size_bytes/1073741824*10)/10 + ' GB' : ''}</option>
+        )) : ''}
+        <option value="custom">Custom path…</option>
+      </select>
+      <input id="toDeviceCustom" type="text" class="form-input mt-sm" placeholder="/dev/nvme0n1" style="display:none" onchange="saveTakeoverOpts()" />
+    </div>
+    <div class="form-group mt-sm">
+      <label class="form-label">Channel</label>
+      <select id="toChannel" class="form-select" onchange="saveTakeoverOpts()">
+        <option value="stable">stable</option>
+        <option value="edge">edge</option>
+      </select>
+    </div>
+    <div id="to-result" class="hidden mt">
+      <p class="dim sm">Run on the target machine in <strong>rescue mode</strong>:</p>
+      <div class="code-block" id="to-body" style="white-space:pre-wrap;word-break:break-all"></div>
+      <div class="flex-row mt-sm">
+        <button class="btn btn-ghost btn-sm" onclick="copyTakeover()">Copy</button>
+        <span id="toCopyOk" class="hidden text-green text-sm">&check; Copied</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto;color:var(--t-red)" onclick="revokeTakeover()">Revoke</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script is:inline>
+// ─── Takeover ───
+function saveTakeoverOpts() {
+  var d = document.getElementById('toDevice');
+  try {
+    localStorage.setItem('to_device', d.value === 'custom'
+      ? document.getElementById('toDeviceCustom').value : d.value);
+    localStorage.setItem('to_channel', document.getElementById('toChannel').value);
+  } catch (e) {}
+}
+
+(function() {
+  var d = document.getElementById('toDevice');
+  // Toggle custom input
+  d.addEventListener('change', function() {
+    var c = document.getElementById('toDeviceCustom');
+    c.style.display = d.value === 'custom' ? 'block' : 'none';
+    if (d.value !== 'custom') saveTakeoverOpts();
+  });
+  // Restore saved
+  try {
+    var sd = localStorage.getItem('to_device'), sc = localStorage.getItem('to_channel');
+    if (sd && d.querySelector('option[value="' + sd + '"]')) d.value = sd;
+    else if (sd) { d.value = 'custom'; document.getElementById('toDeviceCustom').value = sd; document.getElementById('toDeviceCustom').style.display = 'block'; }
+    if (sc) document.getElementById('toChannel').value = sc;
+  } catch (e) {}
+  // Fetch existing
+  fetchTakeover();
+})();
+
+async function fetchTakeover() {
+  try {
+    var r = await fetch(location.origin + '/api/v1/nodes/' + NODE_ID + '/takeover');
+    if (r.status !== 200) return;
+    var data = await r.json();
+    if (data.exists && !data.expired && data.command) {
+      document.getElementById('to-body').textContent = data.command;
+      document.getElementById('to-result').classList.remove('hidden');
+      document.getElementById('toBtn').textContent = 'Regenerate';
+    }
+  } catch (e) {}
+}
+
+async function generateTakeover() {
+  var d = document.getElementById('toDevice');
+  var device = d.value === 'custom'
+    ? (document.getElementById('toDeviceCustom').value || '/dev/sda')
+    : d.value;
+  var channel = document.getElementById('toChannel').value;
+  var body = document.getElementById('to-body');
+  var box = document.getElementById('to-result');
+  var btn = document.getElementById('toBtn');
+
+  saveTakeoverOpts();
+  box.classList.remove('hidden');
+  body.textContent = 'Generating\u2026';
+  btn.disabled = true;
+
+  try {
+    var r = await fetch(location.origin + '/api/v1/nodes/' + NODE_ID + '/takeover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device: device, channel: channel })
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    var data = await r.json();
+    body.textContent = data.command;
+    btn.textContent = 'Regenerate';
+  } catch (e) {
+    body.textContent = 'Error: ' + e.message;
+    btn.textContent = 'Retry';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function copyTakeover() {
+  var t = document.getElementById('to-body').textContent;
+  try {
+    navigator.clipboard.writeText(t).then(function() {
+      var ok = document.getElementById('toCopyOk');
+      ok.classList.remove('hidden');
+      setTimeout(function() { ok.classList.add('hidden'); }, 2000);
+    });
+  } catch (e) {
+    // Fallback: select text
+    var range = document.createRange();
+    range.selectNode(document.getElementById('to-body'));
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    document.execCommand('copy');
+  }
+}
+
+async function revokeTakeover() {
+  if (!confirm('Revoke this takeover token? The command will no longer work.')) return;
+  try {
+    var r = await fetch(location.origin + '/api/v1/nodes/' + NODE_ID + '/takeover', { method: 'DELETE' });
+    if (!r.ok) throw new Error('Failed');
+    document.getElementById('to-result').classList.add('hidden');
+    document.getElementById('toBtn').textContent = 'Generate';
+  } catch (e) { alert('Revoke failed: ' + e.message); }
+}
+</script>
