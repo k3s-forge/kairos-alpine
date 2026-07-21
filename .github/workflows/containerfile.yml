@@ -41,6 +41,27 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Download build binaries
+        run: |
+          mkdir -p build/cni-plugins
+          
+          # Nebula v1.10.0
+          curl -sSL -o nebula.tar.gz \
+            "https://github.com/slackhq/nebula/releases/download/v1.10.0/nebula-linux-amd64.tar.gz"
+          tar xzf nebula.tar.gz -C build/ nebula nebula-cert
+          
+          # Nomad v2.0.3+ent.musl (static musl build)
+          curl -sSL -o nomad.zip \
+            "https://releases.hashicorp.com/nomad/2.0.3+ent.musl/nomad_2.0.3+ent.musl_linux_amd64.zip"
+          unzip -o nomad.zip -d build/ nomad
+          
+          # CNI plugins v1.6.2
+          curl -sSL -o cni.tgz \
+            "https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz"
+          tar xzf cni.tgz -C build/cni-plugins/
+          
+          ls -la build/ build/cni-plugins/
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v6
