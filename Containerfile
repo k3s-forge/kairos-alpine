@@ -28,11 +28,7 @@ COPY build/cni-plugins/ /opt/cni/bin/
 
 # ── Entrypoint ──
 COPY entrypoint.sh /usr/local/bin/tinycloud-init
-
-# ── Release verification script (for CronJob) ──
-COPY disk-images/kairos/verify-release.sh /usr/local/bin/verify-release
-
-RUN chmod +x /usr/local/bin/tinycloud-init /usr/local/bin/verify-release /usr/local/bin/nebula /usr/local/bin/nomad
+RUN chmod +x /usr/local/bin/tinycloud-init /usr/local/bin/nebula /usr/local/bin/nomad
 
 # ── Nomad system jobs (submitted after join) ──
 COPY nomad-jobs/ /etc/nomad-jobs/
