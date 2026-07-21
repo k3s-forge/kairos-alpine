@@ -1,6 +1,6 @@
 // Worker endpoint: GET /api/v1/clusters/[clusterId]/takeover/[token]
-// Returns a bare-metal install script for existing Linux machines.
-// Token is validated once; script embeds Worker URL, enrollment token, and version.
+// Returns a one-line podman command for full-disk takeover installation.
+// The command runs in rescue mode and installs kairos-alpine to /dev/sda.
 
 import type { APIRoute } from 'astro';
 
@@ -10,7 +10,7 @@ export const GET: APIRoute = async ({ params, request }) => {
   try {
     const { clusterId, token } = params;
     const { env } = await import('cloudflare:workers');
-    const kv = env.NOMAD_KV || env.__STATIC_CONTENT;
+    const kv = env.NOMAD_KV;
 
     // 1. Validate enrollment token
     const enrollmentKey = `transform/enrollments/${token}`;
@@ -20,37 +20,39 @@ export const GET: APIRoute = async ({ params, request }) => {
     }
     const enrollment = JSON.parse(enrollmentRaw);
 
-    // Verify cluster match
-    if (enrollment.clusterId !== clusterId) {
+    if (enrollment.clusterId && enrollment.clusterId !== clusterId) {
       return new Response('Token does not match cluster', { status: 403 });
     }
 
-    // Check expiry
     if (enrollment.expiresAt && new Date(enrollment.expiresAt) < new Date()) {
       return new Response('Enrollment token expired', { status: 403 });
     }
 
-    // 2. Get latest version
+    // Mark token as takeover_used
+    enrollment.takeoverUsedAt = new Date().toISOString();
+    await kv.put(enrollmentKey, JSON.stringify(enrollment));
+
+    // 2. Get latest release version
     const releaseKey = 'transform/releases/latest';
     const latestRaw = await kv.get(releaseKey);
     const version = latestRaw ? JSON.parse(latestRaw).version : '2026.07.11';
+    const imageRef = `ghcr.io/k3s-forge/kairos-alpine:${version}`;
 
-    // 3. Generate short-lived GitHub token for GHCR pull
-    const ghcrToken = await getGitHubInstallationToken(env).catch((e) => {
-      console.error('Failed to get GitHub token:', e);
-      return null;
-    });
-
-    // 4. Generate install script
-    const script = generateScript({
+    // 3. Build enrollment seed (base64-encoded JSON)
+    const seed = btoa(JSON.stringify({
       workerUrl: WORKER_URL,
-      clusterId,
       token,
+      clusterId,
       version,
-      ghcrToken,
-    });
+      createdAt: new Date().toISOString(),
+    }));
 
-    return new Response(script, {
+    // 4. Return the podman command
+    const command = `podman run --privileged -v /dev:/dev --rm \\
+  ${imageRef} \\
+  /install.sh /dev/sda "${seed}"`;
+
+    return new Response(command + '\n', {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -61,253 +63,3 @@ export const GET: APIRoute = async ({ params, request }) => {
     return new Response('Internal server error', { status: 500 });
   }
 };
-
-// ─── GitHub App Installation Token ───
-
-async function getGitHubInstallationToken(env: any): Promise<string> {
-  const appId = env.GITHUB_APP_ID;
-  const privateKey = env.GITHUB_APP_PRIVATE_KEY;
-  const installationId = env.GITHUB_APP_INSTALLATION_ID;
-
-  if (!appId || !privateKey || !installationId) {
-    throw new Error('GitHub App secrets not configured');
-  }
-
-  // Generate JWT for GitHub App
-  const now = Math.floor(Date.now() / 1000);
-  const jwtHeader = { alg: 'RS256', typ: 'JWT' };
-  const jwtPayload = {
-    iat: now - 60,
-    exp: now + 600,
-    iss: appId,
-  };
-
-  const encoder = new TextEncoder();
-  const headerB64 = b64url(JSON.stringify(jwtHeader));
-  const payloadB64 = b64url(JSON.stringify(jwtPayload));
-  const signingInput = `${headerB64}.${payloadB64}`;
-
-  // Import private key
-  const pkcs8 = privateKey
-    .replace(/-----BEGIN RSA PRIVATE KEY-----/, '')
-    .replace(/-----END RSA PRIVATE KEY-----/, '')
-    .replace(/-----BEGIN PRIVATE KEY-----/, '')
-    .replace(/-----END PRIVATE KEY-----/, '')
-    .replace(/\n/g, '');
-  const keyData = Uint8Array.from(atob(pkcs8), (c) => c.charCodeAt(0));
-
-  const key = await crypto.subtle.importKey(
-    'pkcs8',
-    keyData,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-
-  const signature = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    key,
-    encoder.encode(signingInput),
-  );
-  const sigB64 = b64url(String.fromCharCode(...new Uint8Array(signature)));
-  const jwt = `${signingInput}.${sigB64}`;
-
-  // Exchange for installation token
-  const resp = await fetch(
-    `https://api.github.com/app/installations/${installationId}/access_tokens`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'transform-worker',
-      },
-    },
-  );
-
-  if (!resp.ok) {
-    throw new Error(`GitHub token exchange failed: ${resp.status}`);
-  }
-
-  const data = await resp.json() as any;
-  return data.token;
-}
-
-function b64url(input: string): string {
-  return btoa(input).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-// ─── Script Generator ───
-
-interface ScriptParams {
-  workerUrl: string;
-  clusterId: string;
-  token: string;
-  version: string;
-  ghcrToken: string | null;
-}
-
-function generateScript(p: ScriptParams): string {
-  const ghcrBlock = p.ghcrToken
-    ? `echo "${p.ghcrToken}" | podman login ghcr.io -u token --password-stdin 2>/dev/null`
-    : 'log "WARNING: GHCR token unavailable; attempting unauthenticated pull"';
-
-  return `#!/bin/sh
-# ─── Kairos Bare-Metal Takeover ───
-# Cluster: ${p.clusterId}
-# Version:  ${p.version}
-# Generated by transform-worker
-# ──────────────────────────────────
-set -e
-
-WORKER_URL="${p.workerUrl}"
-WORKER_TOKEN="${p.token}"
-CLUSTER_ID="${p.clusterId}"
-KAIROS_VERSION="${p.version}"
-
-log() { echo "[kairos] \$(date -Iseconds) \$*" >&2; }
-die()  { log "FATAL: \$*"; exit 1; }
-
-# ─── 1. Detect OS ───
-detect_os() {
-  if [ -f /etc/alpine-release ]; then echo "alpine"
-  elif [ -f /etc/debian_version ]; then echo "debian"
-  elif [ -f /etc/redhat-release ] || [ -f /etc/rocky-release ] || [ -f /etc/fedora-release ]; then echo "el"
-  else echo "unknown"; fi
-}
-
-OS=\$(detect_os)
-log "Detected OS: \$OS"
-
-# ─── 2. Check root ───
-[ "\$(id -u)" = "0" ] || die "Must run as root"
-
-# ─── 3. Install dependencies ───
-install_deps() {
-  log "Installing podman + dependencies..."
-  case "\$OS" in
-    alpine)
-      apk update >&2
-      apk add podman curl jq bash >&2
-      # Alpine needs cgroups started
-      rc-service cgroups start 2>/dev/null || true
-      ;;
-    debian)
-      apt-get update -qq >&2
-      apt-get install -y -qq podman curl jq >&2
-      ;;
-    el)
-      dnf install -y podman curl jq >&2
-      systemctl enable --now podman.socket 2>/dev/null || true
-      ;;
-    *)
-      die "Unsupported OS: \$OS. Requires Alpine, Debian, or EL-based Linux."
-      ;;
-  esac
-  log "Dependencies installed."
-}
-
-install_deps
-
-# ─── 4. Login to GHCR ───
-log "Configuring container registry..."
-${ghcrBlock}
-
-# ─── 5. Pull kairos-alpine image ───
-pull_kairos() {
-  log "Pulling kairos-alpine:\${KAIROS_VERSION}..."
-  podman pull "ghcr.io/k3s-forge/kairos-alpine:\${KAIROS_VERSION}" >&2
-}
-
-RETRY=0
-MAX_RETRIES=3
-while [ \$RETRY -lt \$MAX_RETRIES ]; do
-  if pull_kairos 2>&1; then
-    break
-  fi
-  RETRY=\$((RETRY + 1))
-  [ \$RETRY -lt \$MAX_RETRIES ] && sleep 5
-done
-[ \$RETRY -ge \$MAX_RETRIES ] && die "Failed to pull kairos-alpine after \$MAX_RETRIES attempts"
-
-# ─── 6. Extract binaries ───
-log "Extracting binaries..."
-
-CONTAINER_ID=\$(podman create \\
-  "ghcr.io/k3s-forge/kairos-alpine:\${KAIROS_VERSION}" /bin/true)
-
-mkdir -p /opt/kairos /opt/cni/bin
-
-podman cp "\$CONTAINER_ID:/entrypoint.sh" /opt/kairos/entrypoint.sh
-podman cp "\$CONTAINER_ID:/nebula"       /opt/kairos/nebula
-podman cp "\$CONTAINER_ID:/nomad"        /opt/kairos/nomad
-# CNI plugins directory (may fail gracefully if absent)
-podman cp "\$CONTAINER_ID:/cni-plugins/." /opt/cni/bin/ 2>/dev/null || true
-
-chmod +x /opt/kairos/entrypoint.sh /opt/kairos/nebula /opt/kairos/nomad
-podman rm "\$CONTAINER_ID" >/dev/null 2>&1
-
-log "Binaries installed to /opt/kairos/"
-ls -lh /opt/kairos/ >&2
-
-# ─── 7. Service setup ───
-log "Setting up system service..."
-
-case "\$OS" in
-  alpine)
-    # OpenRC service
-    cat > /etc/init.d/kairos-agent << 'UNITEOF'
-#!/sbin/openrc-run
-name="kairos-agent"
-description="Kairos Node Agent"
-command="/opt/kairos/entrypoint.sh"
-command_args="AUTO"
-command_background=true
-pidfile="/run/kairos-agent.pid"
-depend() {
-  need net
-  after firewall
-}
-UNITEOF
-    chmod +x /etc/init.d/kairos-agent
-    rc-update add kairos-agent default
-    rc-service kairos-agent start
-    log "Service started (openrc)."
-    ;;
-  debian|el)
-    # systemd service
-    cat > /etc/systemd/system/kairos-agent.service << UNITEOF
-[Unit]
-Description=Kairos Node Agent
-Documentation=https://github.com/k3s-forge/kairos-alpine
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/opt/kairos/entrypoint.sh AUTO
-Environment=WORKER_URL=${p.workerUrl}
-Environment=WORKER_TOKEN=${p.token}
-Environment=MODE=AUTO
-Restart=always
-RestartSec=10
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-UNITEOF
-    systemctl daemon-reload
-    systemctl enable --now kairos-agent
-    log "Service started. Monitor: journalctl -u kairos-agent -f"
-    ;;
-esac
-
-# ─── Done ───
-log ""
-log "=== Takeover Complete ==="
-log "Cluster:  \${CLUSTER_ID}"
-log "Worker:   \${WORKER_URL}"
-log "Version:  \${KAIROS_VERSION}"
-log ""
-`;
-}
