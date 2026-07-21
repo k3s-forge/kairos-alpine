@@ -1,5 +1,6 @@
 # tinycloud — self-bootstrapping edge node agent
-# Bootstrap: Nebula + Podman + CNI + Nomad client
+# Runtime:    Bootstrap Nebula + Podman + CNI + Nomad client
+# Installer:  Full-disk takeover (rescue → /dev/sda → reboot → auto-enroll)
 # Steady-state: hands off to Nomad system jobs (BIRD BGP, workloads)
 
 FROM docker.io/library/alpine:3.21
@@ -16,6 +17,20 @@ RUN apk add --no-cache \
     # Nomad + Nebula dirs
     mkdir -p /var/lib/nomad /etc/nomad.d /opt/nomad/plugins /var/lib/nebula /etc/nebula
 
+# ── Takeover installer deps ──
+# Full-disk takeover: partition, format, copy rootfs, install bootloader
+RUN apk add --no-cache \
+    # Partitioning & filesystems
+    gptfdisk dosfstools e2fsprogs \
+    # Rootfs copy
+    rsync \
+    # Bootloader
+    grub-efi efibootmgr \
+    # Init system (for installed OS)
+    openrc \
+    # Kernel (baked into the image for target)
+    linux-virt linux-firmware-none
+
 # ── Nebula v1.10.0 (static binary from GitHub) ──
 COPY build/nebula /usr/local/bin/nebula
 COPY build/nebula-cert /usr/local/bin/nebula-cert
@@ -29,6 +44,10 @@ COPY build/cni-plugins/ /opt/cni/bin/
 # ── Entrypoint ──
 COPY entrypoint.sh /usr/local/bin/tinycloud-init
 RUN chmod +x /usr/local/bin/tinycloud-init /usr/local/bin/nebula /usr/local/bin/nomad
+
+# ── Installer (full-disk takeover) ──
+COPY install.sh /install.sh
+RUN chmod +x /install.sh
 
 # ── Nomad system jobs (submitted after join) ──
 COPY nomad-jobs/ /etc/nomad-jobs/
