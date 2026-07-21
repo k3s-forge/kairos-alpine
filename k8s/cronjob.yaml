@@ -1,0 +1,104 @@
+---
+# Namespace for transform infra on this cluster
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: transform-system
+
+---
+# API token for Worker authentication
+apiVersion: v1
+kind: Secret
+metadata:
+  name: release-watcher-secret
+  namespace: transform-system
+type: Opaque
+stringData:
+  # Override these via kubectl or sealed-secrets in production
+  TRANSFORM_WORKER_URL: "https://transform-worker.bengcor.workers.dev"
+  TRANSFORM_API_TOKEN: "CHANGE_ME"
+
+---
+# ServiceAccount for the release watcher
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-watcher
+  namespace: transform-system
+
+---
+# RBAC: allow creating NodeOpUpgrade CRs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: transform-release-watcher
+rules:
+  - apiGroups: ["operator.kairos.io"]
+    resources: ["nodeopupgrades"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: transform-release-watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: transform-release-watcher
+subjects:
+  - kind: ServiceAccount
+    name: release-watcher
+    namespace: transform-system
+
+---
+# CronJob: polls Worker every 5 minutes, verifies signature,
+# creates NodeOpUpgrade if new version is available.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kairos-release-watcher
+  namespace: transform-system
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: release-watcher
+          restartPolicy: OnFailure
+          # Run on control-plane nodes only (has kubectl access)
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+          containers:
+            - name: watcher
+              image: ghcr.io/k3s-forge/kairos-alpine:stable
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/usr/local/bin/verify-release"]
+              envFrom:
+                - secretRef:
+                    name: release-watcher-secret
+              volumeMounts:
+                - name: pubkey
+                  mountPath: /etc/transform
+                  readOnly: true
+                - name: kubectl
+                  mountPath: /usr/local/bin/kubectl
+                  readOnly: true
+          volumes:
+            - name: pubkey
+              hostPath:
+                path: /etc/transform
+                type: DirectoryOrCreate
+            - name: kubectl
+              hostPath:
+                path: /usr/local/bin/kubectl
+                type: File
