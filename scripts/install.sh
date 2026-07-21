@@ -1,176 +1,265 @@
 #!/bin/sh
-# ─── Kairos Bare-Metal Takeover ───
-# Standalone install script — use when Worker endpoint is unavailable.
-# Set env vars before running:
-#   export WORKER_URL="https://transform-worker.bengcor.workers.dev"
-#   export WORKER_TOKEN="<enrollment-token>"
-#   export KAIROS_VERSION="2026.07.11"
-# Or pass as arguments:
-#   ./install.sh <WORKER_URL> <TOKEN> <VERSION>
+# ─── Kairos Alpine Full-Disk Takeover Installer ───
+# Runs INSIDE the kairos-alpine container.
+# Usage: /install.sh /dev/sda <enrollment-seed-b64>
 #
-# Usage:
-#   curl -sS https://raw.githubusercontent.com/k3s-forge/kairos-alpine/main/scripts/install.sh | bash
-#
-# ──────────────────────────────────
+# The seed is a base64-encoded JSON object from the Worker:
+#  { "workerUrl": "...", "token": "...", "clusterId": "...", "version": "..." }
+# ──────────────────────────────────────────────────
 set -e
 
-WORKER_URL="${1:-${WORKER_URL:-}}"
-WORKER_TOKEN="${2:-${WORKER_TOKEN:-}}"
-KAIROS_VERSION="${3:-${KAIROS_VERSION:-}}"
-
-[ -n "$WORKER_URL" ]   || { echo "ERROR: WORKER_URL not set" >&2; exit 1; }
-[ -n "$WORKER_TOKEN" ] || { echo "ERROR: WORKER_TOKEN not set" >&2; exit 1; }
-
-log() { echo "[kairos] $(date -Iseconds) $*" >&2; }
+log() { echo "[kairos-installer] $(date -Iseconds) $*"; }
 die()  { log "FATAL: $*"; exit 1; }
 
-# ─── 1. Detect OS ───
-detect_os() {
-  if [ -f /etc/alpine-release ]; then echo "alpine"
-  elif [ -f /etc/debian_version ]; then echo "debian"
-  elif [ -f /etc/redhat-release ] || [ -f /etc/rocky-release ] || [ -f /etc/fedora-release ]; then echo "el"
-  else echo "unknown"; fi
-}
+DEVICE="$1"
+SEED="$2"
 
-OS=$(detect_os)
-log "Detected OS: $OS"
+[ -b "$DEVICE" ] || die "$DEVICE is not a valid block device"
+[ -n "$SEED"   ] || die "enrollment seed required (base64-encoded JSON)"
 
-[ "$(id -u)" = "0" ] || die "Must run as root"
+# ─── Decode seed ─────────────────────────────────
+log "Decoding enrollment seed..."
 
-# ─── 2. Install dependencies ───
-install_deps() {
-  log "Installing podman + dependencies..."
-  case "$OS" in
-    alpine)
-      apk update >&2
-      apk add podman curl jq bash >&2
-      rc-service cgroups start 2>/dev/null || true
-      ;;
-    debian)
-      apt-get update -qq >&2
-      apt-get install -y -qq podman curl jq >&2
-      ;;
-    el)
-      dnf install -y podman curl jq >&2
-      systemctl enable --now podman.socket 2>/dev/null || true
-      ;;
-    *) die "Unsupported OS. Requires Alpine/Debian/EL." ;;
+# Try direct decode, then with padding
+echo "$SEED" | base64 -d > /tmp/enrollment.json 2>/dev/null || {
+  PADDED="$SEED"
+  case $(( ${#PADDED} % 4 )) in
+    1) PADDED="${PADDED}===";;
+    2) PADDED="${PADDED}==";;
+    3) PADDED="${PADDED}=";;
   esac
-  log "Dependencies installed."
+  echo "$PADDED" | base64 -d > /tmp/enrollment.json 2>/dev/null || \
+    die "failed to decode enrollment seed: $SEED"
 }
 
-install_deps
+WORKER_URL=$(jq -r .workerUrl /tmp/enrollment.json)
+WORKER_TOKEN=$(jq -r .token /tmp/enrollment.json)
+CLUSTER_ID=$(jq -r .clusterId /tmp/enrollment.json)
+VERSION=$(jq -r .version /tmp/enrollment.json)
 
-# ─── 3. Resolve version if not set ───
-if [ -z "$KAIROS_VERSION" ]; then
-  log "Resolving latest release..."
-  KAIROS_VERSION=$(curl -sS "$WORKER_URL/api/v1/releases/latest" | jq -r .version 2>/dev/null)
-  if [ -z "$KAIROS_VERSION" ] || [ "$KAIROS_VERSION" = "null" ]; then
-    die "Could not resolve latest release version from Worker"
-  fi
-  log "Resolved version: $KAIROS_VERSION"
+[ "$WORKER_URL"   != "null" ] || die "workerUrl missing from seed"
+[ "$WORKER_TOKEN" != "null" ] || die "token missing from seed"
+
+log "Worker:  $WORKER_URL"
+log "Cluster: ${CLUSTER_ID:-unknown}"
+log "Version: ${VERSION:-unknown}"
+
+# ─── 1. Partition ────────────────────────────────
+log "=== Partitioning $DEVICE ==="
+
+# Detect NVMe (nvme0n1 → partition suffix "p1", sda → "1")
+PART_SEP=""
+[ "${DEVICE#/dev/nvme}" != "$DEVICE" ] && PART_SEP="p"
+
+sgdisk --zap-all "$DEVICE"
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DEVICE"
+sgdisk -n 2:0:0     -t 2:8300 -c 2:"kairos-root" "$DEVICE"
+
+partprobe "$DEVICE" 2>/dev/null || true
+sleep 2
+
+EFI_PART="${DEVICE}${PART_SEP}1"
+ROOT_PART="${DEVICE}${PART_SEP}2"
+
+log "EFI:  $EFI_PART"
+log "Root: $ROOT_PART"
+
+# ─── 2. Filesystems ──────────────────────────────
+log "=== Creating filesystems ==="
+mkfs.vfat -F32 -n KAIROS_EFI "$EFI_PART"
+mkfs.ext4 -F -L kairos-root "$ROOT_PART"
+
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+log "Root UUID: $ROOT_UUID"
+
+# ─── 3. Mount ────────────────────────────────────
+log "=== Mounting target ==="
+mkdir -p /mnt/target
+mount "$ROOT_PART" /mnt/target
+mkdir -p /mnt/target/boot
+mount "$EFI_PART" /mnt/target/boot
+
+# ─── 4. Copy rootfs ──────────────────────────────
+log "=== Copying rootfs ==="
+# Exclude virtual filesystems and mount points
+rsync -aAX \
+  --exclude='/dev/*' \
+  --exclude='/proc/*' \
+  --exclude='/sys/*' \
+  --exclude='/tmp/*' \
+  --exclude='/run/*' \
+  --exclude='/mnt/*' \
+  --exclude='/lost+found' \
+  --exclude='/etc/resolv.conf' \
+  --exclude='/install.sh' \
+  / /mnt/target/
+
+mkdir -p /mnt/target/dev  /mnt/target/proc /mnt/target/sys \
+         /mnt/target/tmp  /mnt/target/run  /mnt/target/mnt
+
+cp /etc/resolv.conf /mnt/target/etc/resolv.conf 2>/dev/null || true
+
+log "Rootfs copied ($(du -sh /mnt/target/ 2>/dev/null | cut -f1))"
+
+# ─── 5. Install kernel (if needed) ───────────────
+log "=== Installing kernel ==="
+
+mount --bind /dev  /mnt/target/dev
+mount --bind /proc /mnt/target/proc
+mount --bind /sys  /mnt/target/sys
+
+# Check if kernel exists in the copied rootfs
+if ! ls /mnt/target/boot/vmlinuz-* >/dev/null 2>&1; then
+  log "Kernel not in rootfs, installing via apk..."
+  chroot /mnt/target apk add --no-cache linux-virt linux-firmware-none 2>&1 || \
+    die "kernel install failed"
 fi
 
-# ─── 4. Login to GHCR ───
-log "Configuring container registry..."
-if command -v podman >/dev/null 2>&1; then
-  # Try to get GHCR token from Worker API
-  GHCR_TOKEN=$(curl -sS "$WORKER_URL/api/v1/github/installation-token" \
-    -H "Authorization: Bearer $WORKER_TOKEN" 2>/dev/null | jq -r .token 2>/dev/null || echo "")
-  if [ -n "$GHCR_TOKEN" ] && [ "$GHCR_TOKEN" != "null" ]; then
-    echo "$GHCR_TOKEN" | podman login ghcr.io -u token --password-stdin 2>/dev/null
-    log "GHCR authenticated."
-  else
-    log "WARNING: Could not get GHCR token, attempting unauthenticated pull"
-  fi
-else
-  die "podman not found after installation"
-fi
+KERNEL=$(ls /mnt/target/boot/vmlinuz-* 2>/dev/null | head -1 | xargs basename)
+INITRD=$(ls /mnt/target/boot/initramfs-* 2>/dev/null | head -1 | xargs basename)
+log "Kernel: $KERNEL"
+log "Initrd: $INITRD"
 
-# ─── 5. Pull kairos-alpine image ───
-pull_kairos() {
-  log "Pulling kairos-alpine:$KAIROS_VERSION..."
-  podman pull "ghcr.io/k3s-forge/kairos-alpine:$KAIROS_VERSION" >&2
+# ─── 6. Enrollment seed ──────────────────────────
+log "=== Writing enrollment ==="
+mkdir -p /mnt/target/etc/kairos
+
+# Env file sourced by init script
+cat > /mnt/target/etc/kairos/enrollment << ENVEOF
+# Generated by Kairos Installer
+WORKER_URL=$WORKER_URL
+WORKER_TOKEN=$WORKER_TOKEN
+CLUSTER_ID=${CLUSTER_ID}
+MODE=AUTO
+ENVEOF
+
+# Also write a JSON marker (for visibility)
+cat > /mnt/target/etc/kairos/install-marker.json << JSONEOF
+{
+  "installedAt": "$(date -Iseconds)",
+  "version": "${VERSION}",
+  "workerUrl": "$WORKER_URL",
+  "clusterId": "$CLUSTER_ID",
+  "device": "$DEVICE"
 }
+JSONEOF
 
-RETRY=0
-MAX_RETRIES=3
-while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
-  if pull_kairos; then break; fi
-  RETRY=$((RETRY + 1))
-  [ "$RETRY" -lt "$MAX_RETRIES" ] && sleep 5
-done
-[ "$RETRY" -ge "$MAX_RETRIES" ] && die "Failed to pull image after $MAX_RETRIES attempts"
+# ─── 7. Init service ─────────────────────────────
+log "=== Setting up init service ==="
 
-# ─── 6. Extract binaries ───
-log "Extracting binaries..."
+# Ensure entrypoint exists
+[ -f /mnt/target/usr/local/bin/tinycloud-init ] || die "tinycloud-init not found in image"
+chmod +x /mnt/target/usr/local/bin/tinycloud-init
 
-CONTAINER_ID=$(podman create "ghcr.io/k3s-forge/kairos-alpine:$KAIROS_VERSION" /bin/true)
-
-mkdir -p /opt/kairos /opt/cni/bin
-
-podman cp "$CONTAINER_ID:/entrypoint.sh" /opt/kairos/entrypoint.sh
-podman cp "$CONTAINER_ID:/nebula"       /opt/kairos/nebula
-podman cp "$CONTAINER_ID:/nomad"        /opt/kairos/nomad
-podman cp "$CONTAINER_ID:/cni-plugins/." /opt/cni/bin/ 2>/dev/null || true
-
-chmod +x /opt/kairos/entrypoint.sh /opt/kairos/nebula /opt/kairos/nomad
-podman rm "$CONTAINER_ID" >/dev/null 2>&1
-
-log "Binaries installed:"
-ls -lh /opt/kairos/ >&2
-
-# ─── 7. Service setup ───
-log "Setting up system service..."
-
-CLUSTER_ID=$(echo "$WORKER_TOKEN" | cut -d- -f1,2)
-
-case "$OS" in
-  alpine)
-    cat > /etc/init.d/kairos-agent << 'UNITEOF'
+cat > /mnt/target/etc/init.d/kairos-agent << 'INITSCRIPT'
 #!/sbin/openrc-run
 name="kairos-agent"
-description="Kairos Node Agent"
-command="/opt/kairos/entrypoint.sh"
-command_args="AUTO"
-command_background=true
-pidfile="/run/kairos-agent.pid"
-depend() { need net; after firewall; }
-UNITEOF
-    chmod +x /etc/init.d/kairos-agent
-    rc-update add kairos-agent default
-    rc-service kairos-agent start
-    log "Started (openrc)."
-    ;;
-  debian|el)
-    cat > /etc/systemd/system/kairos-agent.service << UNITEOF
-[Unit]
-Description=Kairos Node Agent
-After=network-online.target
-Wants=network-online.target
+description="Kairos Node Agent — self-bootstrapping edge agent"
 
-[Service]
-Type=simple
-ExecStart=/opt/kairos/entrypoint.sh AUTO
-Environment=WORKER_URL=$WORKER_URL
-Environment=WORKER_TOKEN=$WORKER_TOKEN
-Environment=MODE=AUTO
-Restart=always
-RestartSec=10
-LimitNOFILE=65536
+depend() {
+  need net
+  after bootmisc
+}
 
-[Install]
-WantedBy=multi-user.target
-UNITEOF
-    systemctl daemon-reload
-    systemctl enable --now kairos-agent
-    log "Started (systemd). Monitor: journalctl -u kairos-agent -f"
-    ;;
-esac
+start() {
+  ebegin "Starting Kairos Node Agent"
+  [ -f /etc/kairos/enrollment ] && . /etc/kairos/enrollment
+  export WORKER_URL WORKER_TOKEN CLUSTER_ID MODE
+  start-stop-daemon --start --background --make-pidfile \
+    --pidfile /run/kairos-agent.pid \
+    --stdout /var/log/kairos-agent.log \
+    --stderr /var/log/kairos-agent.log \
+    --exec /usr/local/bin/tinycloud-init -- AUTO
+  eend $?
+}
+
+stop() {
+  ebegin "Stopping Kairos Node Agent"
+  start-stop-daemon --stop --pidfile /run/kairos-agent.pid 2>/dev/null
+  eend $?
+}
+INITSCRIPT
+
+chmod +x /mnt/target/etc/init.d/kairos-agent
+chroot /mnt/target rc-update add kairos-agent default 2>/dev/null || {
+  # Fallback: create symlink manually
+  mkdir -p /mnt/target/etc/runlevels/default
+  ln -s /etc/init.d/kairos-agent /mnt/target/etc/runlevels/default/kairos-agent
+}
+
+# ─── 8. Bootloader ───────────────────────────────
+log "=== Installing GRUB ==="
+
+chroot /mnt/target grub-install \
+  --target=x86_64-efi \
+  --efi-directory=/boot \
+  --bootloader-id=kairos \
+  --recheck 2>&1 || log "WARNING: grub-install failed, writing manual config"
+
+# Manual grub.cfg as fallback / guarantee
+if [ ! -f /mnt/target/boot/grub/grub.cfg ]; then
+  log "Writing manual grub.cfg..."
+  mkdir -p /mnt/target/boot/grub
+  cat > /mnt/target/boot/grub/grub.cfg << GRUBCFG
+set default=0
+set timeout=5
+set root=(hd0,gpt2)
+
+menuentry "Kairos Alpine" {
+  linux /boot/$KERNEL root=UUID=$ROOT_UUID ro quiet console=ttyS0 console=tty0
+  initrd /boot/$INITRD
+}
+
+menuentry "Kairos Alpine (rescue)" {
+  linux /boot/$KERNEL root=UUID=$ROOT_UUID ro single console=ttyS0
+  initrd /boot/$INITRD
+}
+GRUBCFG
+fi
+
+# EFI fallback path (for firmware that ignores NVRAM)
+mkdir -p /mnt/target/boot/EFI/BOOT
+cp /mnt/target/boot/EFI/kairos/grubx64.efi \
+   /mnt/target/boot/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true
+
+# ─── 9. Fstab ────────────────────────────────────
+log "=== Writing fstab ==="
+cat > /mnt/target/etc/fstab << FSTAB
+# Kairos Alpine
+UUID=$ROOT_UUID    /     ext4  defaults,noatime  0 1
+LABEL=KAIROS_EFI   /boot vfat  defaults           0 2
+tmpfs              /tmp  tmpfs defaults,noatime   0 0
+FSTAB
+
+# ─── 10. Network (ensure DHCP on boot) ───────────
+# Alpine default: dhcp on eth0, but be explicit
+mkdir -p /mnt/target/etc/network
+cat > /mnt/target/etc/network/interfaces << IFACES
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+IFACES
+
+# ─── 11. Cleanup ─────────────────────────────────
+log "=== Cleanup ==="
+umount /mnt/target/sys  2>/dev/null || true
+umount /mnt/target/proc 2>/dev/null || true
+umount /mnt/target/dev  2>/dev/null || true
+umount /mnt/target/boot 2>/dev/null || true
+umount /mnt/target      2>/dev/null || true
 
 log ""
-log "=== Takeover Complete ==="
-log "Cluster:  $CLUSTER_ID"
+log "╔══════════════════════════════════════╗"
+log "║  Kairos Alpine Installation Complete ║"
+log "╚══════════════════════════════════════╝"
+log ""
+log "Device:   $DEVICE"
 log "Worker:   $WORKER_URL"
-log "Version:  $KAIROS_VERSION"
+log "Cluster:  ${CLUSTER_ID:-unknown}"
+log "Version:  ${VERSION:-unknown}"
 log ""
+log "Remove rescue media and reboot."
+log "First boot: ~30s to auto-enroll and join cluster."
+log "Monitor:   journalctl -u kairos-agent -f"
