@@ -54,7 +54,7 @@ protocol static static_ptp {
 # with its Nebula IP as the service address.
 {{- range nomadService (env "NOMAD_JOB_NAME") }}
 {{- if ne .NodeUniqueID (env "node.unique.id") }}
-protocol bgp peer_{{ cleanUUID .NodeUniqueID }} {
+protocol bgp peer_{{ replaceAll .NodeUniqueID "-" "" }} {
     local {{ env "attr.unique.network.ip-address" }} as {{ keyOrDefault "bgp_asn" "64800" }};
     neighbor {{ .Address }} as {{ keyOrDefault "bgp_asn" "64800" }};
     hold time 9;
