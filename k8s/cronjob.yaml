@@ -52,6 +52,83 @@ subjects:
     namespace: transform-system
 
 ---
+---
+# verify-release.sh as ConfigMap (mounted instead of embedded in image)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: verify-release-script
+  namespace: transform-system
+data:
+  verify-release.sh: |
+    #!/bin/sh
+    set -e
+    PUBKEY="${TRANSFORM_PUBKEY:-/etc/transform/release-key.pub}"
+    WORKER_URL="${TRANSFORM_WORKER_URL:-https://worker.example.com}"
+    API_TOKEN="${TRANSFORM_API_TOKEN:-}"
+    if [ -z "$API_TOKEN" ]; then
+      echo "FATAL: TRANSFORM_API_TOKEN not set" >&2
+      exit 3
+    fi
+    RESP=$(curl -sfSL -H "Authorization: Bearer ${API_TOKEN}" "${WORKER_URL}/api/v1/releases/latest")
+    SIGNATURE=$(echo "$RESP" | jq -r '.signature // empty')
+    PAYLOAD=$(echo "$RESP" | jq -Sc '.payload // empty')
+    TIMESTAMP=$(echo "$RESP" | jq -r '.timestamp // empty')
+    if [ -z "$SIGNATURE" ] || [ -z "$PAYLOAD" ] || [ -z "$TIMESTAMP" ]; then
+      echo "FATAL: invalid response format" >&2
+      exit 3
+    fi
+    printf '%s\n%s' "$PAYLOAD" "$TIMESTAMP" > /tmp/release-msg.bin
+    SIG_B64=$(echo "$SIGNATURE" | tr '_-' '/+')
+    PAD=$(( (4 - ${#SIG_B64} % 4) % 4 ))
+    PADDED=$(printf '%s%*s' "$SIG_B64" "$PAD" | tr ' ' '=')
+    echo "$PADDED" | base64 -d > /tmp/release-sig.bin 2>/dev/null
+    openssl pkeyutl -verify -pubin -inkey "$PUBKEY" -rawin -in /tmp/release-msg.bin -sigfile /tmp/release-sig.bin || { echo "FATAL: signature verification failed" >&2; exit 1; }
+    echo "Signature verified OK" >&2
+    LATEST_VERSION=$(echo "$PAYLOAD" | jq -r '.version // empty')
+    CURRENT_VERSION=$(grep KAIROS_VERSION /etc/kairos-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "")
+    if [ "$LATEST_VERSION" = "$CURRENT_VERSION" ]; then
+      echo "Already at ${CURRENT_VERSION}" >&2
+      exit 2
+    fi
+    IMAGE=$(echo "$PAYLOAD" | jq -r '.image.oci // empty')
+    DIGEST=$(echo "$PAYLOAD" | jq -r '.image.digest // empty')
+    if [ -n "$DIGEST" ] && [ "$DIGEST" != "null" ]; then
+      IMAGE_REPO=$(echo "$IMAGE" | cut -d: -f1)
+      IMAGE="${IMAGE_REPO}@${DIGEST}"
+    fi
+    echo "Upgrading from ${CURRENT_VERSION} to ${LATEST_VERSION} (image: ${IMAGE})" >&2
+    cat <<EOF
+    apiVersion: operator.kairos.io/v1alpha1
+    kind: NodeOpUpgrade
+    metadata:
+      generateName: auto-upgrade-
+      namespace: default
+    spec:
+      image: ${IMAGE}
+      concurrency: 1
+      stopOnFailure: true
+      upgradeActive: true
+      nodeSelector:
+        matchLabels:
+          kairos.io/managed: "true"
+    EOF
+    exit 0
+
+---
+# Ed25519 public key for release verification
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: release-pubkey
+  namespace: transform-system
+data:
+  release-key.pub: |
+    -----BEGIN PUBLIC KEY-----
+    MCowBQYDK2VwAyEAasHJD1nqanYjBQSRbfdj7KUlNIZMZPNqiaxW60YAqvc=
+    -----END PUBLIC KEY-----
+
+---
 # CronJob: polls Worker every 5 minutes, verifies signature,
 # creates NodeOpUpgrade if new version is available.
 apiVersion: batch/v1
@@ -71,7 +148,6 @@ spec:
         spec:
           serviceAccountName: release-watcher
           restartPolicy: OnFailure
-          # Run on control-plane nodes only (has kubectl access)
           nodeSelector:
             node-role.kubernetes.io/control-plane: "true"
           tolerations:
@@ -82,11 +158,14 @@ spec:
             - name: watcher
               image: ghcr.io/k3s-forge/kairos-alpine:stable
               imagePullPolicy: Always
-              command: ["/bin/sh", "/usr/local/bin/verify-release"]
+              command: ["/bin/sh", "/scripts/verify-release.sh"]
               envFrom:
                 - secretRef:
                     name: release-watcher-secret
               volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
                 - name: pubkey
                   mountPath: /etc/transform
                   readOnly: true
@@ -94,10 +173,13 @@ spec:
                   mountPath: /usr/local/bin/kubectl
                   readOnly: true
           volumes:
+            - name: script
+              configMap:
+                name: verify-release-script
+                defaultMode: 0755
             - name: pubkey
-              hostPath:
-                path: /etc/transform
-                type: DirectoryOrCreate
+              configMap:
+                name: release-pubkey
             - name: kubectl
               hostPath:
                 path: /usr/local/bin/kubectl
