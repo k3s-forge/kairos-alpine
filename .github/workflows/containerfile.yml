@@ -73,7 +73,7 @@ jobs:
               "baseVersion": "3.21"
             },
             "image": {
-              "oci": "ghcr.io/${{ github.repository }}:${VERSION}",
+              "oci": "ghcr.io/${{ github.repository }}",
               "digest": "${DIGEST}",
               "architectures": {
                 "amd64": "${DIGEST}"
