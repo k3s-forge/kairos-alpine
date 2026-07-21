@@ -29,7 +29,7 @@ if [ $? -ne 0 ]; then
 fi
 
 SIGNATURE=$(echo "$RESP" | jq -r '.signature // empty')
-PAYLOAD=$(echo "$RESP" | jq -c '.payload // empty')
+PAYLOAD=$(echo "$RESP" | jq -Sc '.payload // empty')
 TIMESTAMP=$(echo "$RESP" | jq -r '.timestamp // empty')
 
 if [ -z "$SIGNATURE" ] || [ -z "$PAYLOAD" ] || [ -z "$TIMESTAMP" ]; then
