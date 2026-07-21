@@ -134,7 +134,7 @@ resolve_identity() {
         # 1c. Bootstrap — one-shot enrollment token
         log "calling /api/v1/bootstrap"
         local bootstrap
-        bootstrap=$(worker_post "/api/v1/bootstrap" "$jwk" "$WORKER_TOKEN") || {
+        bootstrap=$(worker_post "/api/v1/bootstrap" "{\"publicKey\":$jwk}" "$WORKER_TOKEN") || {
             die "bootstrap failed — enrollment token may be expired or already consumed"
         }
 
