@@ -26,8 +26,6 @@ else
 fi
 
 # ─── RSA JWK extraction (pure shell, no Python/Node) ───
-# Extracts the public key from an RSA PEM and outputs a JWK object.
-# Usage: rsa_pubkey_to_jwk </path/to/key.pem>
 rsa_pubkey_to_jwk() {
     local privkey="$1"
     local pubpem="/tmp/rsa-pub-$$.pem"
@@ -45,7 +43,6 @@ rsa_pubkey_to_jwk() {
     fi
 
     local mod_b64
-    # hex → binary (printf+sed, no xxd needed) → base64url
     mod_b64=$(printf "$(echo "$mod_hex" | sed 's/\(..\)/\\x\1/g')" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
     if [ -z "$mod_b64" ]; then
         die "failed to encode modulus"
@@ -54,60 +51,57 @@ rsa_pubkey_to_jwk() {
     printf '{"kty":"RSA","alg":"RSA-OAEP-256","n":"%s","e":"AQAB","ext":true,"key_ops":["encrypt"]}' "$mod_b64"
 }
 
-# ─── Worker API call with retry ───
+# ─── Worker API ───
+# Usage: worker_get <path> [auth_token] [max_retries=3]
+# Returns body on 200/201, logs retries to stderr, returns non-zero on failure.
 worker_get() {
     local path="$1" auth="${2:-}" max_retries="${3:-3}"
-    local code
+    local code curl_rc respfile="/tmp/worker-resp-$$.txt"
+    local curl_opts=(-sS --connect-timeout 10 --max-time 30 -w '%{http_code}' -o "$respfile")
+
+    if [ -n "$auth" ]; then
+        curl_opts+=(-H "Authorization: Bearer $auth")
+    fi
+
     for i in $(seq 1 "$max_retries"); do
-        if [ -n "$auth" ]; then
-            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
-                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
-                -H "Authorization: Bearer $auth" \
-                "$WORKER_URL$path" 2>/dev/null || echo "000")
-        else
-            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
-                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
-                "$WORKER_URL$path" 2>/dev/null || echo "000")
-        fi
+        code=$(curl "${curl_opts[@]}" "$WORKER_URL$path" 2>/dev/null) || true
+        # Strip trailing newline from -w output, keep only numeric code
+        code="${code//[!0-9]/}"
         if [ "$code" = "200" ] || [ "$code" = "201" ]; then
-            cat /tmp/worker-resp-$$.txt
-            rm -f /tmp/worker-resp-$$.txt
+            cat "$respfile"
+            rm -f "$respfile"
             return 0
         fi
-        log "worker GET $path → HTTP $code, retry $i/$max_retries"
+        log "worker GET $path → HTTP $code, retry $i/$max_retries" >&2
         sleep 2
     done
-    rm -f /tmp/worker-resp-$$.txt
+    rm -f "$respfile"
     return 1
 }
 
 worker_post() {
     local path="$1" body="$2" auth="${3:-}" max_retries="${4:-3}"
-    local code
+    local code respfile="/tmp/worker-resp-$$.txt"
+    local curl_opts=(-sS --connect-timeout 10 --max-time 30
+        -w '%{http_code}' -o "$respfile"
+        -H "Content-Type: application/json" -d "$body")
+
+    if [ -n "$auth" ]; then
+        curl_opts+=(-H "Authorization: Bearer $auth")
+    fi
+
     for i in $(seq 1 "$max_retries"); do
-        if [ -n "$auth" ]; then
-            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
-                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
-                -H "Authorization: Bearer $auth" \
-                -H "Content-Type: application/json" \
-                -d "$body" \
-                "$WORKER_URL$path" 2>/dev/null || echo "000")
-        else
-            code=$(curl -sfS --connect-timeout 10 --max-time 30 \
-                -w '%{http_code}' -o /tmp/worker-resp-$$.txt \
-                -H "Content-Type: application/json" \
-                -d "$body" \
-                "$WORKER_URL$path" 2>/dev/null || echo "000")
-        fi
+        code=$(curl "${curl_opts[@]}" "$WORKER_URL$path" 2>/dev/null) || true
+        code="${code//[!0-9]/}"
         if [ "$code" = "200" ] || [ "$code" = "201" ]; then
-            cat /tmp/worker-resp-$$.txt
-            rm -f /tmp/worker-resp-$$.txt
+            cat "$respfile"
+            rm -f "$respfile"
             return 0
         fi
-        log "worker POST $path → HTTP $code, retry $i/$max_retries"
+        log "worker POST $path → HTTP $code, retry $i/$max_retries" >&2
         sleep 2
     done
-    rm -f /tmp/worker-resp-$$.txt
+    rm -f "$respfile"
     return 1
 }
 
@@ -115,21 +109,21 @@ worker_post() {
 resolve_identity() {
     log "resolving identity"
 
-    # ── AUTO mode: pull everything from Worker ──
     if [[ -n "${WORKER_URL:-}" && -n "${WORKER_TOKEN:-}" ]]; then
+        # ═══ AUTO mode ═══
         log "AUTO mode: pulling identity from $WORKER_URL"
 
-        # 1a. Generate RSA-4096 key pair for Worker encryption
+        # 1a. Generate RSA-4096 key pair
         if [[ ! -f /var/lib/nebula/node.key ]]; then
             log "generating RSA-4096 key pair"
             mkdir -p /var/lib/nebula
             openssl genrsa -out /var/lib/nebula/node.key 4096 2>/dev/null
         fi
 
-        # 1b. Extract public key as JWK
+        # 1b. Public key → JWK
         local jwk
         jwk=$(rsa_pubkey_to_jwk /var/lib/nebula/node.key)
-        log "public key JWK: ${jwk:0:80}..."
+        log "public key JWK ready"
 
         # 1c. Bootstrap — one-shot enrollment token
         log "calling /api/v1/bootstrap"
@@ -157,14 +151,10 @@ resolve_identity() {
             export NEBULA_PORT="${NEBULA_PORT:-$(echo "$cluster" | jq -r '.nebula.port // empty')}"
             export CNI_SUBNET="${CNI_SUBNET:-$(echo "$cluster" | jq -r '.bgp.cni_subnet // empty')}"
 
-            # Static host map: { "IP": ["host:port"], ... } → "IP=host:port,IP=host:port"
+            # Static host map: {"IP":"addr"|["addr"],...} → "IP=addr,IP=addr"
             local shm
-            shm=$(echo "$cluster" | jq -r '
-                .nebula.static_host_map // {} |
-                to_entries |
-                map("\(.key)=\(.value[0])") |
-                join(",")
-            ' 2>/dev/null)
+            shm=$(echo "$cluster" \
+                | jq -r '[.nebula.static_host_map // {} | to_entries[] | "\(.key)=\(.value | if type == "array" then .[0] else . end)"] | join(",")')
             export STATIC_HOST_MAP="${STATIC_HOST_MAP:-$shm}"
         fi
 
@@ -178,18 +168,46 @@ resolve_identity() {
         # 1f. Nebula host cert + key (authenticated with nodeToken)
         log "pulling Nebula host cert"
         local hostCert
-        hostCert=$(worker_get "/api/v1/clusters/nebula/host-cert?clusterId=$CLUSTER_ID" "$NODE_TOKEN") || {
-            die "failed to pull host cert"
-        }
+        hostCert=$(worker_get "/api/v1/clusters/nebula/host-cert?clusterId=$CLUSTER_ID" "$NODE_TOKEN") || true
 
-        echo "$hostCert" | jq -r '.cert // empty' > /var/lib/nebula/host.crt
-        echo "$hostCert" | jq -r '.key // empty' > /var/lib/nebula/host.key
-        chmod 600 /var/lib/nebula/host.key
-
-        if [ ! -s /var/lib/nebula/host.crt ] || [ ! -s /var/lib/nebula/host.key ]; then
-            die "host cert or key empty"
+        if [ -n "$hostCert" ] && [ "$hostCert" != "null" ]; then
+            echo "$hostCert" | jq -r '.cert // empty' > /var/lib/nebula/host.crt
+            echo "$hostCert" | jq -r '.key // empty' > /var/lib/nebula/host.key
+            chmod 600 /var/lib/nebula/host.key
         fi
-        log "host cert saved"
+
+        # Fallback: generate host cert locally using CA key from Worker
+        if [ ! -s /var/lib/nebula/host.crt ] || [ ! -s /var/lib/nebula/host.key ]; then
+            log "host cert not pre-provisioned, generating locally"
+
+            local caKey
+            caKey=$(worker_get "/api/v1/clusters/nebula/ca-key?clusterId=$CLUSTER_ID" "$NODE_TOKEN") || {
+                die "failed to pull CA key for local cert generation"
+            }
+            echo "$caKey" > /var/lib/nebula/ca.key
+            chmod 600 /var/lib/nebula/ca.key
+
+            # Determine Nebula IP: env var X, or derive from nodeId (1-254)
+            local nebulaIP="${NEBULA_IP:-}"
+            if [ -z "$nebulaIP" ]; then
+                local octet
+                octet=$(echo "$NODE_ID" | cksum | awk '{print ($1 % 254) + 1}')
+                nebulaIP="192.168.200.$octet"
+            fi
+            log "using Nebula IP: $nebulaIP"
+
+            nebula-cert sign \
+                -name "$NODE_ID" \
+                -ip "$nebulaIP/24" \
+                -out-crt /var/lib/nebula/host.crt \
+                -out-key /var/lib/nebula/host.key \
+                -ca-crt /var/lib/nebula/ca.crt \
+                -ca-key /var/lib/nebula/ca.key || {
+                die "nebula-cert sign failed"
+            }
+            rm -f /var/lib/nebula/ca.key
+            log "host cert generated locally"
+        fi
 
         # Store node identity for later use
         echo "$bootstrap" | jq '.identity' > /var/lib/nebula/identity.json
@@ -199,7 +217,7 @@ resolve_identity() {
         return 0
     fi
 
-    # ── LOCAL mode: certs are pre-mounted ──
+    # ═══ LOCAL mode ═══
     if [ -f /var/lib/nebula/host.crt ] && [ -f /var/lib/nebula/host.key ] && [ -f /var/lib/nebula/ca.crt ]; then
         log "LOCAL mode: using pre-mounted certs"
         return 0
@@ -227,6 +245,7 @@ generate_nebula_config() {
         done
     fi
 
+    mkdir -p /etc/nebula
     cat > "$config" <<YAML
 pki:
   ca: /var/lib/nebula/ca.crt
@@ -290,7 +309,6 @@ YAML
 start_nebula() {
     log "starting Nebula"
 
-    # Kill any existing Nebula
     killall nebula 2>/dev/null || true
     sleep 1
 
@@ -302,7 +320,6 @@ start_nebula() {
         die "Nebula failed to start"
     fi
 
-    # Wait for TUN device
     for i in $(seq 1 30); do
         if ip link show nebula1 >/dev/null 2>&1; then
             log "Nebula TUN (nebula1) ready"
@@ -323,7 +340,11 @@ start_podman() {
 # ─── step 5: start Nomad ───
 start_nomad() {
     log "starting Nomad client"
+    mkdir -p /var/lib/nomad/data /etc/nomad.d
+
     cat > /etc/nomad.d/client.hcl <<HCL
+data_dir = "/var/lib/nomad/data"
+
 client {
   enabled = true
   server_join {
@@ -348,7 +369,7 @@ echo "=== tinycloud v0.5.0 ==="
 resolve_identity
 generate_nebula_config
 
-if [ "$MODE" = "bootstrap" ]; then
+if [ "$MODE" = "bootstrap" ] || [ "$MODE" = "AUTO" ] || [ "$MODE" = "LOCAL" ]; then
     if ! ip link show nebula1 >/dev/null 2>&1; then
         start_nebula
     fi
