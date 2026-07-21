@@ -129,15 +129,27 @@ jobs:
           echo "=== release.json ==="
           cat release.json
 
-      - name: Create GitHub Release
+      - name: Attach to GitHub Release
         run: |
           TAG="${{ github.ref_name }}"
+          # containerfile.yml creates the Release first; attach assets here
           ISO_FILES=$(ls *.iso 2>/dev/null || true)
           SHA_FILES=$(ls *.sha256 2>/dev/null || true)
+          ASSETS="$ISO_FILES $SHA_FILES release.json"
+          
+          # Upload assets to existing release
+          for f in $ASSETS; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber
+          done
+          
+          # Update body with ISO info
           if [ -n "$ISO_FILES" ]; then
-            gh release create "$TAG" --title "$TAG" --generate-notes $ISO_FILES $SHA_FILES release.json
-          else
-            gh release create "$TAG" --title "$TAG" --generate-notes release.json
+            echo "" >> /tmp/release-notes.md
+            echo "### Kairos ISO" >> /tmp/release-notes.md
+            for iso in $ISO_FILES; do
+              echo "- \`$iso\`" >> /tmp/release-notes.md
+            done
+            gh release edit "$TAG" --notes-file /tmp/release-notes.md --append 2>/dev/null || true
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
