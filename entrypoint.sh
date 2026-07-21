@@ -9,13 +9,21 @@ set -euo pipefail
 # Bootstrap: Nebula + Podman socket + CNI + Nomad client
 # Steady-state: submits BIRD system job → Nomad manages everything
 
-: "${NOMAD_SERVER:?NOMAD_SERVER required (or provide WORKER_URL+WORKER_TOKEN)}"
-: "${NEBULA_LIGHTHOUSE:?NEBULA_LIGHTHOUSE required (or provide WORKER_URL+WORKER_TOKEN)}"
-HOSTNAME="${HOSTNAME:-$(hostname)}"
+: "${HOSTNAME:=$(hostname)}"
 MODE="${1:-bootstrap}"
 
 log() { echo "[tinycloud] $(date -Iseconds) $*"; }
 die()  { log "FATAL: $*"; exit 1; }
+
+# AUTO mode: WORKER_URL + WORKER_TOKEN → bootstrap from Worker API
+if [ -n "${WORKER_URL:-}" ] && [ -n "${WORKER_TOKEN:-}" ]; then
+    MODE=AUTO
+    log "AUTO mode: bootstrapping from $WORKER_URL"
+else
+    : "${NOMAD_SERVER:?NOMAD_SERVER required (or provide WORKER_URL+WORKER_TOKEN)}"
+    : "${NEBULA_LIGHTHOUSE:?NEBULA_LIGHTHOUSE required (or provide WORKER_URL+WORKER_TOKEN)}"
+    MODE=LOCAL
+fi
 
 # ─── RSA JWK extraction (pure shell, no Python/Node) ───
 # Extracts the public key from an RSA PEM and outputs a JWK object.
