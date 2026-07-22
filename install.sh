@@ -47,9 +47,12 @@ log "Version: ${VERSION:-unknown}"
 # ─── 1. Partition ────────────────────────────────
 log "=== Partitioning $DEVICE ==="
 
-# Detect NVMe (nvme0n1 → partition suffix "p1", sda → "1")
+# Detect partition suffix: NVMe and loop devices use "p" (nvme0n1p1, loop0p1)
+# Regular block devices use no separator (sda1, vda1)
 PART_SEP=""
-[ "${DEVICE#/dev/nvme}" != "$DEVICE" ] && PART_SEP="p"
+case "$DEVICE" in
+  /dev/nvme*|/dev/loop*) PART_SEP="p" ;;
+esac
 
 # Use sgdisk if available, fall back to gdisk
 if command -v sgdisk >/dev/null 2>&1; then
