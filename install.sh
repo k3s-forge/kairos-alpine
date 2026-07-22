@@ -113,17 +113,21 @@ mount "$EFI_PART" /mnt/target/boot
 # ─── 4. Copy rootfs ──────────────────────────────
 log "=== Copying rootfs ==="
 # Exclude virtual filesystems and mount points
-rsync -aAX \
-  --exclude='/dev/*' \
-  --exclude='/proc/*' \
-  --exclude='/sys/*' \
+# Note: FAT32 EFI doesn't support symlinks (e.g. /boot/boot -> .)
+rsync -aAX --delete \
+  --exclude='/dev' \
+  --exclude='/proc' \
+  --exclude='/sys' \
   --exclude='/tmp/*' \
-  --exclude='/run/*' \
-  --exclude='/mnt/*' \
+  --exclude='/run' \
+  --exclude='/mnt' \
   --exclude='/lost+found' \
   --exclude='/etc/resolv.conf' \
   --exclude='/install.sh' \
-  / /mnt/target/
+  --exclude='/var/lib/containers' \
+  --exclude='/var/lib/nomad' \
+  --exclude='/boot/boot' \
+  / /mnt/target/ 2>&1 || log "WARNING: rsync had non-fatal errors"
 
 mkdir -p /mnt/target/dev  /mnt/target/proc /mnt/target/sys \
          /mnt/target/tmp  /mnt/target/run  /mnt/target/mnt
