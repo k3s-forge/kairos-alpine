@@ -51,9 +51,37 @@ log "=== Partitioning $DEVICE ==="
 PART_SEP=""
 [ "${DEVICE#/dev/nvme}" != "$DEVICE" ] && PART_SEP="p"
 
-sgdisk --zap-all "$DEVICE"
-sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DEVICE"
-sgdisk -n 2:0:0     -t 2:8300 -c 2:"kairos-root" "$DEVICE"
+# Use sgdisk if available, fall back to gdisk
+if command -v sgdisk >/dev/null 2>&1; then
+  sgdisk --zap-all "$DEVICE"
+  sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DEVICE"
+  sgdisk -n 2:0:0     -t 2:8300 -c 2:"kairos-root" "$DEVICE"
+elif command -v gdisk >/dev/null 2>&1; then
+  gdisk "$DEVICE" <<GDISK
+x
+z
+y
+y
+GDISK
+  gdisk "$DEVICE" <<GDISK
+n
+
+
++512M
+ef00
+
+n
+
+
+
+8300
+
+w
+y
+GDISK
+else
+  die "no partitioning tool found (sgdisk or gdisk required)"
+fi
 
 partprobe "$DEVICE" 2>/dev/null || true
 sleep 2
