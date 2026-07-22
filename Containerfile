@@ -21,7 +21,7 @@ RUN apk add --no-cache \
 # Full-disk takeover: partition, format, copy rootfs, install bootloader
 RUN apk add --no-cache \
     # Partitioning & filesystems
-    gptfdisk dosfstools e2fsprogs \
+    gptfdisk sgdisk parted dosfstools e2fsprogs \
     # Rootfs copy
     rsync \
     # Bootloader
