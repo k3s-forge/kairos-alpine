@@ -100,7 +100,7 @@ log "=== Creating filesystems ==="
 mkfs.vfat -F32 -n KAIROS_EFI "$EFI_PART"
 mkfs.ext4 -F -L kairos-root "$ROOT_PART"
 
-ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+ROOT_UUID=$(blkid "$ROOT_PART" | grep -o 'UUID="[^"]*"' | cut -d'"' -f2)
 log "Root UUID: $ROOT_UUID"
 
 # ─── 3. Mount ────────────────────────────────────
@@ -238,16 +238,16 @@ if [ ! -f /mnt/target/boot/grub/grub.cfg ]; then
   cat > /mnt/target/boot/grub/grub.cfg << GRUBCFG
 set default=0
 set timeout=5
-set root=(hd0,gpt2)
+set root=(hd0,gpt1)
 
 menuentry "Kairos Alpine" {
-  linux /boot/$KERNEL root=UUID=$ROOT_UUID ro quiet console=ttyS0 console=tty0
-  initrd /boot/$INITRD
+  linux /$KERNEL root=UUID=$ROOT_UUID ro quiet console=ttyS0 console=tty0
+  initrd /$INITRD
 }
 
 menuentry "Kairos Alpine (rescue)" {
-  linux /boot/$KERNEL root=UUID=$ROOT_UUID ro single console=ttyS0
-  initrd /boot/$INITRD
+  linux /$KERNEL root=UUID=$ROOT_UUID ro single console=ttyS0
+  initrd /$INITRD
 }
 GRUBCFG
 fi
